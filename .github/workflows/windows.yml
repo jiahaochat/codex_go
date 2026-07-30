@@ -1,0 +1,182 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Verify synchronized versions
+        shell: powershell
+        run: |
+          $packageVersion = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $lockVersion = (Get-Content -Raw package-lock.json | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $cargoText = Get-Content -Raw src-tauri/Cargo.toml
+          $cargoVersion = [regex]::Match($cargoText, '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $versions = @($packageVersion, $lockVersion, $tauriVersion, $cargoVersion) | Select-Object -Unique
+          if ($versions.Count -ne 1) {
+            throw "Version mismatch: package=$packageVersion lock=$lockVersion tauri=$tauriVersion cargo=$cargoVersion"
+          }
+
+      - name: Verify frontend
+        run: |
+          npm run test
+          npm run build
+
+      - name: Prepare pinned Windows assets
+        shell: powershell
+        run: ./scripts/prepare-windows-assets.ps1
+
+      - name: Verify Rust backend
+        env:
+          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Verify release secrets are configured
+        if: github.event_name != 'pull_request'
+        shell: powershell
+        env:
+          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          RELEASE_REPO_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
+        run: |
+          $required = @(
+            'CODEX_GO_DEFAULT_VLESS_URI',
+            'TAURI_SIGNING_PRIVATE_KEY',
+            'TAURI_SIGNING_PRIVATE_KEY_PASSWORD',
+            'RELEASE_REPO_TOKEN'
+          )
+          foreach ($name in $required) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required Actions secret $name is not configured"
+            }
+          }
+
+      - name: Build NSIS installer
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+        env:
+          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build
+
+      - name: Upload Windows installer
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex_go-windows-x64
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sig
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.sig
+          if-no-files-found: error
+
+      - name: Verify release tag matches app version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        run: |
+          $tauriVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          if ("v$tauriVersion" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match app version v$tauriVersion"
+          }
+
+      - name: Publish signed Windows release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
+          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          owner: jiahaochat
+          repo: codex_go-releases
+          releaseCommitish: main
+          tagName: v__VERSION__
+          releaseName: codex_go v__VERSION__
+          releaseBody: Windows 稳定版安装包。应用内更新会验证 Tauri 签名。
+          releaseDraft: false
+          prerelease: false
+          updaterJsonPreferNsis: true
+          uploadUpdaterJson: true
+
+      - name: Use public download URLs in updater metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
+        run: |
+          $latestPath = Join-Path $env:GITHUB_WORKSPACE 'latest.json'
+          if (-not (Test-Path -LiteralPath $latestPath)) {
+            throw 'tauri-action did not generate latest.json'
+          }
+
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'codex-go-release-workflow'
+          }
+          $tag = [Uri]::EscapeDataString('${{ github.ref_name }}')
+          $release = Invoke-RestMethod `
+            -Headers $headers `
+            -Uri "https://api.github.com/repos/jiahaochat/codex_go-releases/releases/tags/$tag"
+          $assets = @{}
+          foreach ($asset in $release.assets) {
+            $assets[[string]$asset.id] = [string]$asset.browser_download_url
+          }
+
+          $latest = Get-Content -Raw -LiteralPath $latestPath | ConvertFrom-Json
+          foreach ($platform in $latest.platforms.PSObject.Properties) {
+            $match = [regex]::Match([string]$platform.Value.url, '/releases/assets/(?<id>\d+)$')
+            if (-not $match.Success -or -not $assets.ContainsKey($match.Groups['id'].Value)) {
+              throw "Unable to resolve the public download URL for $($platform.Name)"
+            }
+            $platform.Value.url = $assets[$match.Groups['id'].Value]
+            if (-not $platform.Value.url.StartsWith('https://github.com/jiahaochat/codex_go-releases/releases/download/')) {
+              throw "Unexpected updater URL for $($platform.Name)"
+            }
+          }
+
+          $encoding = New-Object Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText($latestPath, ($latest | ConvertTo-Json -Depth 10), $encoding)
+          gh release upload '${{ github.ref_name }}' $latestPath `
+            --repo jiahaochat/codex_go-releases `
+            --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to replace latest.json with public download URLs'
+          }

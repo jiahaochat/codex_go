@@ -37,9 +37,9 @@ jobs:
       - name: Verify synchronized versions
         shell: powershell
         run: |
-          $packageVersion = (Get-Content -Raw package.json | ConvertFrom-Json).version
-          $lockVersion = (Get-Content -Raw package-lock.json | ConvertFrom-Json).version
-          $tauriVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $packageVersion = node -p "require('./package.json').version"
+          $lockVersion = node -p "require('./package-lock.json').version"
+          $tauriVersion = node -p "require('./src-tauri/tauri.conf.json').version"
           $cargoText = Get-Content -Raw src-tauri/Cargo.toml
           $cargoVersion = [regex]::Match($cargoText, '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
           $versions = @($packageVersion, $lockVersion, $tauriVersion, $cargoVersion) | Select-Object -Unique
@@ -109,7 +109,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: powershell
         run: |
-          $tauriVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $tauriVersion = node -p "require('./src-tauri/tauri.conf.json').version"
           if ("v$tauriVersion" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match app version v$tauriVersion"
           }

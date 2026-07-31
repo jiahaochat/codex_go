@@ -1,6 +1,6 @@
 # codex_go
 
-`codex_go` 是面向 Windows 用户的 Codex 本机管理器。它检测 Microsoft Store 分发的官方 Codex Windows 桌面端，展示当前用户 `CODEX_HOME` 中已安装的插件和 Skills，并可安装或更新到 Microsoft Store 提供的最新稳定版。
+`codex_go` 是面向 Windows 用户的 Codex 本机管理器。它检测 Microsoft Store 分发的官方 Codex Windows 桌面端，展示当前用户 `CODEX_HOME` 中已安装的插件和 Skills，并可安装、更新或从 Codex Go 直接启动官方桌面端。
 
 这是一个真正的 Tauri Windows 桌面程序，不需要用浏览器打开。浏览器里的 `127.0.0.1:3000` 只是前端开发预览，不具备完整的本机功能。
 
@@ -37,6 +37,8 @@ scripts\build-windows.cmd
 ## 当前功能
 
 - 通过 `Get-AppxPackage OpenAI.Codex` 检测官方 Codex Windows 桌面端，并读取 Microsoft Store 包版本与安装位置。
+- “运行”会通过 Windows 打包应用激活器从 Codex Go 启动官方桌面端，再通过仅监听本机的 Chromium DevTools Protocol 注入右上角 `Codex Go <版本号>` 标识，不修改官方应用文件。
+- 运行状态明确区分“未运行”“未通过 Codex Go 运行”“已运行”。已有可见的 Codex 窗口不是由 Codex Go 启动时不会强行接管；只有没有窗口的残留后台进程会在用户点击“运行”后自动清理，以免阻塞启动。
 - 扫描 `CODEX_HOME` 中的插件 manifest 和缓存。
 - 扫描个人、系统及插件附带的 `SKILL.md`，限制递归深度且不跟随目录链接。
 - 使用固定版本 Xray，将内置网络通道转为带随机认证的本机 HTTP 代理。

@@ -10,6 +10,18 @@ export interface CodexStatus {
   source: string | null;
 }
 
+export interface CodexRuntimeStatus {
+  state: "stopped" | "unmanaged" | "managed";
+  running: boolean;
+  managed: boolean;
+  restartRequired: boolean;
+}
+
+export interface CodexLaunchProgress {
+  stage: "cleaning" | "starting" | "connecting" | "injecting" | "complete";
+  message: string;
+}
+
 export interface PluginItem {
   id: string;
   name: string;
@@ -20,6 +32,9 @@ export interface PluginItem {
   path: string | null;
   source: InventorySource;
   error: string | null;
+  icon: string | null;
+  official: boolean;
+  canDelete: boolean;
 }
 
 export interface SkillItem {
@@ -31,11 +46,16 @@ export interface SkillItem {
   path: string;
   source: InventorySource;
   error: string | null;
+  icon: string | null;
+  pluginIcon: string | null;
+  official: boolean;
+  canDelete: boolean;
 }
 
 export interface AppSnapshot {
   appVersion: string;
   codex: CodexStatus;
+  codexRuntime: CodexRuntimeStatus;
   codexHome: string;
   plugins: PluginItem[];
   skills: SkillItem[];
@@ -47,6 +67,10 @@ export interface InstallProgress {
   stage: "preparing" | "proxy" | "downloading" | "installing" | "verifying" | "complete" | "error";
   percent: number;
   message: string;
+}
+
+export interface CodexUpdateInfo {
+  available: boolean;
 }
 
 export interface UpdateInfo {
@@ -70,18 +94,27 @@ const previewSnapshot: AppSnapshot = {
     version: "26.721.4979.0",
     source: "Microsoft Store",
   },
+  codexRuntime: {
+    state: "stopped",
+    running: false,
+    managed: false,
+    restartRequired: false,
+  },
   codexHome: "C:\\Users\\jiahao\\.codex",
   plugins: [
     {
-      id: "openai-developer-docs@personal",
+      id: "openai-developer-docs@openai-bundled",
       name: "openai-developer-docs",
       version: "1.4.2",
       description: "OpenAI 官方开发文档与 API 参考",
       enabled: true,
-      marketplace: "personal",
-      path: "C:\\Users\\jiahao\\.codex\\plugins\\cache\\personal\\openai-developer-docs\\1.4.2",
+      marketplace: "openai-bundled",
+      path: "C:\\Users\\jiahao\\.codex\\plugins\\cache\\openai-bundled\\openai-developer-docs\\1.4.2",
       source: "filesystem",
       error: null,
+      icon: null,
+      official: true,
+      canDelete: false,
     },
     {
       id: "team-review@workspace",
@@ -93,6 +126,9 @@ const previewSnapshot: AppSnapshot = {
       path: "C:\\Users\\jiahao\\.codex\\plugins\\cache\\workspace\\team-review\\0.8.0",
       source: "filesystem",
       error: null,
+      icon: null,
+      official: false,
+      canDelete: true,
     },
   ],
   skills: [
@@ -105,6 +141,10 @@ const previewSnapshot: AppSnapshot = {
       path: "C:\\Users\\jiahao\\.codex\\skills\\.system\\openai-docs",
       source: "filesystem",
       error: null,
+      icon: null,
+      pluginIcon: null,
+      official: true,
+      canDelete: false,
     },
     {
       id: "release-review",
@@ -115,6 +155,10 @@ const previewSnapshot: AppSnapshot = {
       path: "C:\\Users\\jiahao\\.codex\\skills\\release-review",
       source: "filesystem",
       error: null,
+      icon: null,
+      pluginIcon: null,
+      official: false,
+      canDelete: true,
     },
     {
       id: "team-review/security-pass",
@@ -125,6 +169,10 @@ const previewSnapshot: AppSnapshot = {
       path: "C:\\Users\\jiahao\\.codex\\plugins\\cache\\workspace\\team-review\\0.8.0\\skills\\security-pass",
       source: "filesystem",
       error: null,
+      icon: null,
+      pluginIcon: null,
+      official: false,
+      canDelete: true,
     },
   ],
   warnings: [],
@@ -158,9 +206,36 @@ export async function updateCodex(): Promise<void> {
   await invoke("update_codex");
 }
 
+export async function launchCodex(codex: CodexStatus): Promise<CodexRuntimeStatus> {
+  if (!isTauri()) return { state: "managed", running: true, managed: true, restartRequired: false };
+  return invoke<CodexRuntimeStatus>("launch_codex", { codex });
+}
+
+export async function checkCodexUpdate(): Promise<CodexUpdateInfo> {
+  if (!isTauri()) return { available: false };
+  return invoke<CodexUpdateInfo>("check_codex_update");
+}
+
 export async function revealPath(path: string): Promise<void> {
   if (!isTauri()) return;
   await invoke("reveal_path", { path });
+}
+
+export async function deletePlugin(pluginId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("delete_plugin", { pluginId });
+}
+
+export async function deleteSkill(skillId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("delete_skill", { skillId });
+}
+
+export async function readSkillContent(skillId: string): Promise<string> {
+  if (!isTauri()) {
+    return "# Skill 内容\n\n当前为浏览器预览模式。请在 Codex Go 桌面端查看完整的 SKILL.md。";
+  }
+  return invoke<string>("read_skill_content", { skillId });
 }
 
 export async function checkAppUpdate(): Promise<UpdateInfo | null> {
@@ -178,6 +253,13 @@ export async function onInstallProgress(
 ): Promise<UnlistenFn> {
   if (!isTauri()) return () => undefined;
   return listen<InstallProgress>("install-progress", (event) => callback(event.payload));
+}
+
+export async function onCodexLaunchProgress(
+  callback: (progress: CodexLaunchProgress) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<CodexLaunchProgress>("codex-launch-progress", (event) => callback(event.payload));
 }
 
 export async function onAppUpdateProgress(

@@ -3,6 +3,11 @@ import type { PluginItem, SkillItem } from "./api";
 export type PluginFilter = "all" | "enabled" | "disabled";
 export type SkillFilter = "all" | "personal" | "plugin" | "system";
 
+export interface PluginSkillGroup {
+  pluginName: string;
+  items: SkillItem[];
+}
+
 export function filterPlugins(items: PluginItem[], query: string, filter: PluginFilter): PluginItem[] {
   const needle = normalize(query);
   return items.filter((item) => {
@@ -20,6 +25,34 @@ export function filterSkills(items: SkillItem[], query: string, filter: SkillFil
     const matchesQuery = !needle || haystack.includes(needle);
     return matchesQuery && (filter === "all" || item.origin === filter);
   });
+}
+
+export function groupSkillsByPlugin(items: SkillItem[]): {
+  standalone: SkillItem[];
+  pluginGroups: PluginSkillGroup[];
+} {
+  const standalone: SkillItem[] = [];
+  const groups = new Map<string, PluginSkillGroup>();
+
+  for (const item of items) {
+    if (item.origin !== "plugin") {
+      standalone.push(item);
+      continue;
+    }
+
+    const pluginName = item.pluginName?.trim() || "未识别插件";
+    const key = pluginName.toLocaleLowerCase("zh-CN");
+    const group = groups.get(key);
+    if (group) group.items.push(item);
+    else groups.set(key, { pluginName, items: [item] });
+  }
+
+  return {
+    standalone,
+    pluginGroups: [...groups.values()].sort((left, right) =>
+      left.pluginName.localeCompare(right.pluginName, "zh-CN"),
+    ),
+  };
 }
 
 function normalize(value: string): string {

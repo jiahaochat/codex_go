@@ -1,5 +1,6 @@
 mod installer;
 mod inventory;
+mod launcher;
 mod process_guard;
 mod proxy;
 mod secrets;
@@ -28,7 +29,7 @@ impl OperationState {
     fn acquire(&self) -> Result<OperationPermit<'_>, String> {
         self.running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "另一项安装或更新任务正在运行".to_owned())?;
+            .map_err(|_| "另一项 Codex 操作正在运行".to_owned())?;
         Ok(OperationPermit { state: self })
     }
 }
@@ -44,6 +45,7 @@ impl Drop for OperationPermit<'_> {
 struct AppSnapshot {
     app_version: String,
     codex: CodexStatus,
+    codex_runtime: launcher::CodexRuntimeStatus,
     codex_home: String,
     plugins: Vec<PluginItem>,
     skills: Vec<SkillItem>,
@@ -61,6 +63,27 @@ async fn refresh_snapshot(app: AppHandle) -> Result<AppSnapshot, String> {
     collect_snapshot(app).await
 }
 
+#[tauri::command]
+async fn delete_plugin(plugin_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || inventory::delete_plugin(&plugin_id))
+        .await
+        .map_err(|_| "删除插件时发生内部错误".to_owned())?
+}
+
+#[tauri::command]
+async fn delete_skill(skill_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || inventory::delete_skill(&skill_id))
+        .await
+        .map_err(|_| "删除 Skill 时发生内部错误".to_owned())?
+}
+
+#[tauri::command]
+async fn read_skill_content(skill_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || inventory::read_skill_content(&skill_id))
+        .await
+        .map_err(|_| "读取 Skill 内容时发生内部错误".to_owned())?
+}
+
 async fn collect_snapshot(app: AppHandle) -> Result<AppSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || build_snapshot(&app))
         .await
@@ -69,6 +92,7 @@ async fn collect_snapshot(app: AppHandle) -> Result<AppSnapshot, String> {
 
 fn build_snapshot(app: &AppHandle) -> AppSnapshot {
     let inventory = inventory::collect_inventory();
+    let codex_runtime = launcher::runtime_status(&inventory.codex);
     let warnings = inventory
         .warnings
         .into_iter()
@@ -78,6 +102,7 @@ fn build_snapshot(app: &AppHandle) -> AppSnapshot {
     AppSnapshot {
         app_version: app.package_info().version.to_string(),
         codex: inventory.codex,
+        codex_runtime,
         codex_home: inventory.codex_home,
         plugins: inventory.plugins,
         skills: inventory.skills,
@@ -128,6 +153,27 @@ async fn update_codex(app: AppHandle, state: State<'_, OperationState>) -> Resul
         );
     }
     result
+}
+
+#[tauri::command]
+async fn launch_codex(
+    app: AppHandle,
+    state: State<'_, OperationState>,
+    codex: CodexStatus,
+) -> Result<launcher::CodexRuntimeStatus, String> {
+    let _permit = state.acquire()?;
+    launcher::launch(&app, &codex).await
+}
+
+#[tauri::command]
+async fn check_codex_update(
+    app: AppHandle,
+    state: State<'_, OperationState>,
+) -> Result<installer::CodexUpdateInfo, String> {
+    let _permit = state.acquire()?;
+    tauri::async_runtime::spawn_blocking(move || installer::check_update(&app))
+        .await
+        .map_err(|_| "Codex 更新检查意外中止".to_owned())?
 }
 
 #[tauri::command]
@@ -208,8 +254,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             refresh_snapshot,
+            delete_plugin,
+            delete_skill,
+            read_skill_content,
             install_codex,
             update_codex,
+            check_codex_update,
+            launch_codex,
             check_app_update,
             install_app_update,
             reveal_path

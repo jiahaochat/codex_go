@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -56,6 +57,9 @@ pub struct PluginItem {
     pub path: Option<String>,
     pub source: InventorySource,
     pub error: Option<String>,
+    pub icon: Option<String>,
+    pub official: bool,
+    pub can_delete: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +82,10 @@ pub struct SkillItem {
     pub path: String,
     pub source: InventorySource,
     pub error: Option<String>,
+    pub icon: Option<String>,
+    pub plugin_icon: Option<String>,
+    pub official: bool,
+    pub can_delete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +109,8 @@ struct PluginRoot {
     path: PathBuf,
     identity: String,
     name: String,
+    icon: Option<String>,
+    official: bool,
 }
 
 #[derive(Debug)]
@@ -499,6 +509,9 @@ fn collect_cli_plugins(
                     path: None,
                     source: InventorySource::Command,
                     error: None,
+                    icon: None,
+                    official: false,
+                    can_delete: false,
                 });
             }
         }
@@ -537,6 +550,9 @@ fn collect_cli_plugins(
                             path: None,
                             source: InventorySource::Command,
                             error: None,
+                            icon: None,
+                            official: false,
+                            can_delete: false,
                         });
                     }
                 }
@@ -616,6 +632,37 @@ fn plugin_from_object(
         )
     });
     let id = plugin_id(&name, marketplace.as_deref(), explicit_id.as_deref());
+    let official = is_official_marketplace(marketplace.as_deref());
+    let path = string_field(
+        object,
+        &[
+            "path",
+            "location",
+            "directory",
+            "root",
+            "installPath",
+            "install_path",
+            "installedPath",
+            "installed_path",
+        ],
+    )
+    .or_else(|| {
+        nested_string_field(
+            object,
+            "source",
+            &[
+                "path",
+                "location",
+                "directory",
+                "root",
+                "installPath",
+                "install_path",
+                "installedPath",
+                "installed_path",
+            ],
+        )
+    });
+    let can_delete = path.is_some() && !official;
 
     Some(PluginItem {
         id,
@@ -628,38 +675,118 @@ fn plugin_from_object(
             .or_else(|| nested_string_field(object, "manifest", &["description", "summary"])),
         enabled: bool_field(object, &["enabled", "active"]).unwrap_or(true),
         marketplace,
-        path: string_field(
-            object,
-            &[
-                "path",
-                "location",
-                "directory",
-                "root",
-                "installPath",
-                "install_path",
-                "installedPath",
-                "installed_path",
-            ],
-        )
-        .or_else(|| {
-            nested_string_field(
-                object,
-                "source",
-                &[
-                    "path",
-                    "location",
-                    "directory",
-                    "root",
-                    "installPath",
-                    "install_path",
-                    "installedPath",
-                    "installed_path",
-                ],
-            )
-        }),
+        path,
         source: InventorySource::Command,
         error: string_field(object, &["error"]),
+        icon: None,
+        official,
+        can_delete,
     })
+}
+
+pub fn delete_plugin(plugin_id: &str) -> Result<(), String> {
+    let codex_home = resolve_codex_home();
+    let plugins = scan_plugin_manifests(&codex_home);
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin.id == plugin_id)
+        .ok_or_else(|| "插件已不存在，请刷新后重试".to_owned())?;
+    if plugin.official || !plugin.can_delete {
+        return Err("OpenAI 官方内置插件不能删除".to_owned());
+    }
+
+    let plugin_path = PathBuf::from(
+        plugin
+            .path
+            .as_deref()
+            .ok_or_else(|| "该插件没有可删除的本地目录".to_owned())?,
+    );
+    let cache_root = codex_home.join("plugins").join("cache");
+    let target = plugin_container_path(&plugin_path, &cache_root).unwrap_or(plugin_path);
+    remove_inventory_directory(&target, &codex_home.join("plugins"), "插件")
+}
+
+pub fn delete_skill(skill_id: &str) -> Result<(), String> {
+    let codex_home = resolve_codex_home();
+    let plugins = scan_plugin_manifests(&codex_home);
+    let plugin_roots = plugin_roots_from(&plugins);
+    let skills = scan_skills(&codex_home, &plugin_roots);
+    let skill = skills
+        .iter()
+        .find(|skill| skill.id == skill_id)
+        .ok_or_else(|| "Skill 已不存在，请刷新后重试".to_owned())?;
+    if skill.official || !skill.can_delete {
+        return Err("OpenAI 官方内置 Skill 不能删除".to_owned());
+    }
+
+    let target = PathBuf::from(&skill.path);
+    match skill.origin {
+        SkillOrigin::Personal => {
+            remove_inventory_directory(&target, &codex_home.join("skills"), "Skill")
+        }
+        SkillOrigin::Plugin => {
+            let plugin_root = plugin_roots
+                .iter()
+                .find(|plugin| canonical_path_is_within(&target, &plugin.path))
+                .ok_or_else(|| "无法确认该 Skill 所属的插件目录".to_owned())?;
+            if paths_are_equal(&target, &plugin_root.path) {
+                return Err("该 Skill 与插件共用根目录，请从插件列表删除整个插件".to_owned());
+            }
+            remove_inventory_directory(&target, &plugin_root.path, "Skill")
+        }
+        SkillOrigin::System | SkillOrigin::Unknown => Err("该 Skill 不能删除".to_owned()),
+    }
+}
+
+pub fn read_skill_content(skill_id: &str) -> Result<String, String> {
+    let codex_home = resolve_codex_home();
+    let plugins = scan_plugin_manifests(&codex_home);
+    let skills = scan_skills(&codex_home, &plugin_roots_from(&plugins));
+    let skill = skills
+        .iter()
+        .find(|skill| skill.id == skill_id)
+        .ok_or_else(|| "Skill 已不存在，请刷新后重试".to_owned())?;
+    let path = PathBuf::from(&skill.path).join("SKILL.md");
+    read_limited_text(&path, MAX_METADATA_FILE_BYTES)
+        .map_err(|_| "无法读取该 Skill 的 SKILL.md".to_owned())
+}
+
+fn plugin_container_path(plugin_path: &Path, cache_root: &Path) -> Option<PathBuf> {
+    let relative = plugin_path.strip_prefix(cache_root).ok()?;
+    let mut components = relative.components();
+    let marketplace = components.next()?;
+    let plugin_name = components.next()?;
+    components.next()?;
+    Some(
+        cache_root
+            .join(marketplace.as_os_str())
+            .join(plugin_name.as_os_str()),
+    )
+}
+
+fn paths_are_equal(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn remove_inventory_directory(
+    target: &Path,
+    allowed_root: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let target = fs::canonicalize(target).map_err(|_| format!("{label} 目录已不存在"))?;
+    let allowed_root =
+        fs::canonicalize(allowed_root).map_err(|_| format!("无法确认 {label} 的安全目录边界"))?;
+    if target == allowed_root || !target.starts_with(&allowed_root) {
+        return Err(format!("拒绝删除安全目录之外的 {label}"));
+    }
+    let metadata = fs::symlink_metadata(&target).map_err(|_| format!("无法读取 {label} 目录"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("{label} 目标不是可删除的普通目录"));
+    }
+    fs::remove_dir_all(&target).map_err(|error| format!("删除 {label} 失败：{error}"))
 }
 
 fn bool_field(object: &Map<String, Value>, aliases: &[&str]) -> Option<bool> {
@@ -812,6 +939,21 @@ fn read_plugin_manifest(manifest_path: &Path) -> Option<PluginItem> {
         .or_else(|| nested_string_field(object, "metadata", &["marketplace", "registry", "scope"]))
         .or_else(|| infer_marketplace(plugin_root));
     let id = plugin_id(&name, marketplace.as_deref(), explicit_id.as_deref());
+    let official = is_official_marketplace(marketplace.as_deref());
+    let icon_path = nested_string_field(
+        object,
+        "interface",
+        &[
+            "composerIcon",
+            "composer_icon",
+            "logo",
+            "logoDark",
+            "logo_dark",
+        ],
+    );
+    let icon = icon_path
+        .as_deref()
+        .and_then(|path| load_icon_data(plugin_root, plugin_root, path));
 
     Some(PluginItem {
         id,
@@ -827,6 +969,18 @@ fn read_plugin_manifest(manifest_path: &Path) -> Option<PluginItem> {
         path: Some(path_to_string(plugin_root)),
         source: InventorySource::Filesystem,
         error: None,
+        icon,
+        official,
+        can_delete: !official,
+    })
+}
+
+fn is_official_marketplace(marketplace: Option<&str>) -> bool {
+    marketplace.is_some_and(|value| {
+        matches!(
+            normalize_identifier(value).as_str(),
+            "openaibundled" | "openaiprimaryruntime"
+        )
     })
 }
 
@@ -870,6 +1024,11 @@ fn deduplicate_plugins(plugins: Vec<PluginItem>) -> Vec<PluginItem> {
 
 fn merge_plugin(existing: &mut PluginItem, incoming: PluginItem) {
     let incoming_is_cli = incoming.source == InventorySource::Command;
+    if existing.icon.is_none() {
+        existing.icon = incoming.icon.clone();
+    }
+    existing.official |= incoming.official;
+    existing.can_delete = (existing.can_delete || incoming.can_delete) && !existing.official;
     if incoming_is_cli || existing.version.is_none() {
         existing.version = incoming.version.or_else(|| existing.version.take());
     }
@@ -917,6 +1076,8 @@ fn plugin_roots_from(plugins: &[PluginItem]) -> Vec<PluginRoot> {
                 path,
                 identity,
                 name: plugin.name.clone(),
+                icon: plugin.icon.clone(),
+                official: plugin.official,
             })
         })
         .collect()
@@ -1077,6 +1238,12 @@ fn read_skill(path: &Path, origin: SkillOrigin, plugin: Option<&PluginRoot>) -> 
         Some(plugin) => format!("{}/{name}", plugin.identity),
         None => name.clone(),
     };
+    let official = origin == SkillOrigin::System || plugin.is_some_and(|plugin| plugin.official);
+    let icon_root = plugin.map_or(skill_directory, |plugin| plugin.path.as_path());
+    let icon = read_skill_icon(skill_directory, icon_root);
+    let plugin_icon = plugin.and_then(|plugin| plugin.icon.clone());
+    let can_delete = matches!(origin, SkillOrigin::Personal)
+        || (matches!(origin, SkillOrigin::Plugin) && !official);
 
     Some(SkillItem {
         id,
@@ -1087,7 +1254,70 @@ fn read_skill(path: &Path, origin: SkillOrigin, plugin: Option<&PluginRoot>) -> 
         path: path_to_string(skill_directory),
         source: InventorySource::Filesystem,
         error: None,
+        icon,
+        plugin_icon,
+        official,
+        can_delete,
     })
+}
+
+fn read_skill_icon(skill_directory: &Path, allowed_root: &Path) -> Option<String> {
+    let metadata_path = skill_directory.join("agents").join("openai.yaml");
+    let contents = read_limited_text(&metadata_path, MAX_METADATA_FILE_BYTES).ok()?;
+    let relative_path = yaml_scalar_field(&contents, "icon_small")
+        .or_else(|| yaml_scalar_field(&contents, "icon_large"))?;
+    load_icon_data(skill_directory, allowed_root, &relative_path)
+}
+
+fn yaml_scalar_field(contents: &str, field: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let (key, value) = trimmed.split_once(':')?;
+        (normalize_identifier(key) == normalize_identifier(field))
+            .then(|| parse_yaml_scalar(value))
+            .flatten()
+    })
+}
+
+fn load_icon_data(base: &Path, allowed_root: &Path, relative_path: &str) -> Option<String> {
+    let relative = Path::new(relative_path.trim());
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return None;
+    }
+
+    let path = fs::canonicalize(base.join(relative)).ok()?;
+    let root = fs::canonicalize(allowed_root).ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+
+    let mime = match path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("ico") => "image/x-icon",
+        _ => return None,
+    };
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_METADATA_FILE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    Some(format!(
+        "data:{mime};base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    ))
 }
 
 fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
@@ -1502,6 +1732,69 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_official_inventory_and_loads_declared_icons() {
+        let temporary = tempdir().unwrap();
+        let codex_home = temporary.path().join(".codex");
+        let plugin_root = codex_home.join("plugins/cache/openai-bundled/docs/1.0.0");
+        let manifest_directory = plugin_root.join(".codex-plugin");
+        let skill_directory = plugin_root.join("skills/docs");
+        fs::create_dir_all(manifest_directory.as_path()).unwrap();
+        fs::create_dir_all(plugin_root.join("assets")).unwrap();
+        fs::create_dir_all(skill_directory.join("agents")).unwrap();
+        fs::create_dir_all(skill_directory.join("assets")).unwrap();
+        fs::write(plugin_root.join("assets/plugin.svg"), "<svg></svg>").unwrap();
+        fs::write(skill_directory.join("assets/skill.png"), b"png").unwrap();
+        fs::write(
+            manifest_directory.join("plugin.json"),
+            r#"{"name":"docs","skills":"./skills","interface":{"composerIcon":"./assets/plugin.svg"}}"#,
+        )
+        .unwrap();
+        fs::write(skill_directory.join("SKILL.md"), "---\nname: docs\n---\n").unwrap();
+        fs::write(
+            skill_directory.join("agents/openai.yaml"),
+            "interface:\n  icon_small: \"./assets/skill.png\"\n",
+        )
+        .unwrap();
+
+        let plugins = scan_plugin_manifests(&codex_home);
+        assert_eq!(plugins.len(), 1);
+        assert!(plugins[0].official);
+        assert!(!plugins[0].can_delete);
+        assert!(plugins[0]
+            .icon
+            .as_deref()
+            .is_some_and(|icon| icon.starts_with("data:image/svg+xml;base64,")));
+
+        let skills = scan_skills(&codex_home, &plugin_roots_from(&plugins));
+        assert_eq!(skills.len(), 1);
+        assert!(skills[0].official);
+        assert!(!skills[0].can_delete);
+        assert!(skills[0]
+            .icon
+            .as_deref()
+            .is_some_and(|icon| icon.starts_with("data:image/png;base64,")));
+        assert!(skills[0]
+            .plugin_icon
+            .as_deref()
+            .is_some_and(|icon| icon.starts_with("data:image/svg+xml;base64,")));
+    }
+
+    #[test]
+    fn deletion_stays_within_the_allowed_inventory_root() {
+        let temporary = tempdir().unwrap();
+        let allowed = temporary.path().join("plugins");
+        let target = allowed.join("marketplace/plugin");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        assert!(remove_inventory_directory(&outside, &allowed, "插件").is_err());
+        assert!(outside.exists());
+        remove_inventory_directory(&target, &allowed, "插件").unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn rejects_unsafe_manifest_skill_paths() {
         for path in ["../outside", "/outside", r"C:\\outside", r"\\server\\share"] {
             assert_eq!(safe_manifest_relative_path(path), None);
@@ -1532,12 +1825,17 @@ mod tests {
             path: "C:/Users/example/.codex/skills/demo".to_owned(),
             source: InventorySource::Filesystem,
             error: None,
+            icon: None,
+            plugin_icon: None,
+            official: false,
+            can_delete: true,
         };
         let value = serde_json::to_value(skill).unwrap();
 
         assert_eq!(value["pluginName"], Value::Null);
         assert_eq!(value["origin"], "personal");
         assert_eq!(value["source"], "filesystem");
+        assert_eq!(value["canDelete"], true);
     }
 
     #[cfg(unix)]

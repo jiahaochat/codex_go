@@ -15,6 +15,7 @@ use crate::{inventory, process_guard::ChildJob, proxy, secrets};
 
 const STORE_PRODUCT_ID: &str = "9PLM9XGG6VKS";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CHECK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
@@ -23,6 +24,12 @@ pub struct InstallProgress {
     pub stage: String,
     pub percent: u8,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUpdateInfo {
+    pub available: bool,
 }
 
 /// Installs the official Codex Windows desktop app from Microsoft Store.
@@ -41,6 +48,45 @@ pub fn update(app: &AppHandle) -> Result<(), String> {
     run_winget(app, "upgrade", "正在更新官方 Codex Windows 桌面端")
 }
 
+/// Checks for a Store update without starting an installation.
+pub fn check_update(app: &AppHandle) -> Result<CodexUpdateInfo, String> {
+    ensure_winget_proxy_enabled()?;
+    let uri = secrets::vless_uri()?;
+    let runtime = proxy::start(app, uri)?;
+    let output = run_winget_command(
+        &[
+            "list",
+            "--id",
+            STORE_PRODUCT_ID,
+            "--exact",
+            "--source",
+            "msstore",
+            "--upgrade-available",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ],
+        &runtime,
+        CHECK_TIMEOUT,
+        "Codex Windows 更新检查超过 3 分钟，任务已停止",
+    )?;
+    let output_text = process_output_text(&output);
+
+    if has_available_update(&output_text) {
+        return Ok(CodexUpdateInfo { available: true });
+    }
+
+    if output.status.success() || is_already_current_message(&output_text) {
+        return Ok(CodexUpdateInfo { available: false });
+    }
+
+    let detail = process_error(&output, &runtime);
+    Err(if detail.is_empty() {
+        "无法检查 Codex Windows 更新".to_owned()
+    } else {
+        format!("无法检查 Codex Windows 更新: {detail}")
+    })
+}
+
 fn run_winget(app: &AppHandle, action: &str, action_message: &str) -> Result<(), String> {
     ensure_winget_proxy_enabled()?;
     let uri = secrets::vless_uri()?;
@@ -52,7 +98,22 @@ fn run_winget(app: &AppHandle, action: &str, action_message: &str) -> Result<(),
         "正在通过 Microsoft Store 获取最新稳定版",
     );
     emit(app, "installing", 55, action_message);
-    let output = run_winget_command(action, &runtime)?;
+    let output = run_winget_command(
+        &[
+            action,
+            "--id",
+            STORE_PRODUCT_ID,
+            "--exact",
+            "--source",
+            "msstore",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ],
+        &runtime,
+        INSTALL_TIMEOUT,
+        "Codex Windows 桌面端安装或更新超过 30 分钟，任务已停止",
+    )?;
 
     if !output.status.success() && !is_already_current(&output) {
         let detail = process_error(&output, &runtime);
@@ -75,7 +136,12 @@ fn run_winget(app: &AppHandle, action: &str, action_message: &str) -> Result<(),
     Ok(())
 }
 
-fn run_winget_command(action: &str, runtime: &proxy::ProxyRuntime) -> Result<Output, String> {
+fn run_winget_command(
+    args: &[&str],
+    runtime: &proxy::ProxyRuntime,
+    timeout: Duration,
+    timeout_message: &str,
+) -> Result<Output, String> {
     let mut stdout_file =
         tempfile::tempfile().map_err(|_| "无法准备 Microsoft Store 日志".to_owned())?;
     let mut stderr_file =
@@ -89,17 +155,7 @@ fn run_winget_command(action: &str, runtime: &proxy::ProxyRuntime) -> Result<Out
 
     let mut command = Command::new(winget_path());
     command
-        .args([
-            action,
-            "--id",
-            STORE_PRODUCT_ID,
-            "--exact",
-            "--source",
-            "msstore",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--disable-interactivity",
-        ])
+        .args(args)
         .arg("--proxy")
         .arg(&runtime.url)
         .stdin(Stdio::null())
@@ -112,7 +168,7 @@ fn run_winget_command(action: &str, runtime: &proxy::ProxyRuntime) -> Result<Out
         .map_err(|error| format!("无法启动 winget.exe: {error}"))?;
     let _job =
         ChildJob::attach(&mut child).map_err(|_| "无法约束 Microsoft Store 安装进程".to_owned())?;
-    let deadline = Instant::now() + INSTALL_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child
             .try_wait()
@@ -122,7 +178,7 @@ fn run_winget_command(action: &str, runtime: &proxy::ProxyRuntime) -> Result<Out
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Codex Windows 桌面端安装或更新超过 30 分钟，任务已停止".to_owned());
+                return Err(timeout_message.to_owned());
             }
             None => thread::sleep(Duration::from_millis(100)),
         }
@@ -146,12 +202,15 @@ fn read_process_output(file: &mut File) -> Result<Vec<u8>, String> {
 }
 
 fn is_already_current(output: &Output) -> bool {
-    let text = format!(
+    is_already_current_message(&process_output_text(output))
+}
+
+fn process_output_text(output: &Output) -> String {
+    format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-    is_already_current_message(&text)
+    )
 }
 
 fn is_already_current_message(message: &str) -> bool {
@@ -160,10 +219,22 @@ fn is_already_current_message(message: &str) -> bool {
         "no applicable update found",
         "no available upgrade found",
         "no newer package versions are available",
+        "no installed package found matching input criteria",
+        "no package found matching input criteria",
         "没有适用的更新",
+        "找不到可用的升级",
+        "没有可用的较新的包版本",
+        "没有找到符合输入条件的已安装程序包",
+        "没有找到与输入条件匹配的已安装程序包",
     ]
     .iter()
     .any(|expected| message.contains(expected))
+}
+
+fn has_available_update(message: &str) -> bool {
+    message
+        .to_lowercase()
+        .contains(&STORE_PRODUCT_ID.to_lowercase())
 }
 
 fn process_error(output: &Output, runtime: &proxy::ProxyRuntime) -> String {
@@ -293,5 +364,27 @@ mod tests {
     fn recognizes_current_winget_no_upgrade_message() {
         let output = "No available upgrade found. No newer package versions are available from the configured sources.";
         assert!(is_already_current_message(output));
+    }
+
+    #[test]
+    fn recognizes_localized_winget_no_upgrade_message() {
+        let output = "找不到可用的升级。配置的源中没有可用的较新的包版本。";
+        assert!(is_already_current_message(output));
+    }
+
+    #[test]
+    fn recognizes_empty_upgrade_filter_result() {
+        assert!(is_already_current_message(
+            "No installed package found matching input criteria."
+        ));
+        assert!(is_already_current_message(
+            "没有找到与输入条件匹配的已安装程序包。"
+        ));
+    }
+
+    #[test]
+    fn recognizes_store_product_in_upgrade_list() {
+        let output = "Codex 9PLM9XGG6VKS 26.7.1 26.7.2 msstore";
+        assert!(has_available_update(output));
     }
 }

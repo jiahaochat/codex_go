@@ -11,7 +11,7 @@ const plugins: PluginItem[] = [
     enabled: true,
     marketplace: "personal",
     path: "C:\\docs",
-    source: "command",
+    source: "filesystem",
     error: null,
   },
   {

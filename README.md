@@ -1,8 +1,8 @@
 # codex_go
 
-`codex_go` 是面向国内 Windows 用户的 Codex 本机管理器。它检测 Codex CLI，展示当前用户 `CODEX_HOME` 中已安装的插件和 Skills，并在 Codex 缺失时通过内置的 VLESS/Xray 线路运行 OpenAI 官方安装程序。
+`codex_go` 是面向 Windows 用户的 Codex 本机管理器。它检测 Microsoft Store 分发的官方 Codex Windows 桌面端，展示当前用户 `CODEX_HOME` 中已安装的插件和 Skills，并可安装或更新到 Microsoft Store 提供的最新稳定版。
 
-这是一个真正的 Tauri Windows 桌面程序，不需要用浏览器打开。浏览器里的 `127.0.0.1:1420` 只是前端开发预览，不具备完整的本机功能。
+这是一个真正的 Tauri Windows 桌面程序，不需要用浏览器打开。浏览器里的 `127.0.0.1:3000` 只是前端开发预览，不具备完整的本机功能。
 
 ## 在 Windows 运行
 
@@ -36,14 +36,14 @@ scripts\build-windows.cmd
 
 ## 当前功能
 
-- 从 `PATH`、OpenAI standalone 默认目录和 npm 全局目录检测 `codex`，并读取版本。
-- 优先通过 `codex plugin list --json` 获取插件状态，失败时扫描 `CODEX_HOME` 中的 manifest 和缓存。
+- 通过 `Get-AppxPackage OpenAI.Codex` 检测官方 Codex Windows 桌面端，并读取 Microsoft Store 包版本与安装位置。
+- 扫描 `CODEX_HOME` 中的插件 manifest 和缓存。
 - 扫描个人、系统及插件附带的 `SKILL.md`，限制递归深度且不跟随目录链接。
-- 使用固定版本 Xray，将 VLESS + REALITY + XHTTP 转为带随机认证的本机 HTTP 代理。
-- 代理只监听 `127.0.0.1`，只覆盖 Codex 安装、应用更新检查和更新包下载，不修改 Windows 系统代理。
-- 使用固定 OpenAI Codex 提交中的官方 `install.ps1`，运行前再次校验 SHA-256。
+- 使用固定版本 Xray，将内置网络通道转为带随机认证的本机 HTTP 代理。
+- Codex Windows 桌面端使用 Microsoft Store 官方渠道安装和更新；需要 Windows App Installer（`winget`）。
+- 代理只监听 `127.0.0.1`，覆盖 `codex_go` 发起的软件更新以及 Codex 安装、升级任务，不修改 Windows 系统代理。
 - 启动后读取公开 Release 的 `latest.json`，比较当前版本，并在用户确认后下载、验签和安装更新。
-- VLESS 链路只从构建 Secret 注入；正式版本没有线路设置入口，也不会在 UI 或日志中回显链接。
+- 网络通道固定内置，没有设置或覆盖入口，也不会在 UI 或日志中回显链接。
 
 ## 本地验证
 
@@ -56,15 +56,12 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-开发时可在当前 PowerShell 会话临时设置 `CODEX_GO_VLESS_URI`。它只是未注入构建 Secret 时的开发后备，不要把真实值写入项目文件。
-
 ## 远程更新与发布
 
 项目只使用一个公开的 GitHub 仓库 `jiahaochat/codex_go`，源码、安装包、Tauri 签名和 `latest.json` 都在同一个仓库。这样普通用户无需 Git 或 GitHub Token 即可访问 Release 更新。
 
 该仓库需要以下 Actions Secrets：
 
-- `CODEX_GO_DEFAULT_VLESS_URI`：内置下载线路。
 - `TAURI_SIGNING_PRIVATE_KEY`：Tauri updater 私钥。
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码。
 
@@ -76,9 +73,9 @@ Updater 私钥一旦丢失，就无法再给已安装客户端发布可验证的
 2. 提交并推送 `main`，等待 Windows 构建通过。
 3. 创建并推送同版本标签，例如 `git tag -a v0.2.0 -m "codex_go v0.2.0"` 和 `git push origin v0.2.0`。
 4. GitHub Actions 只接受 `main` 历史上的标签，按 `Cargo.lock` 构建签名 NSIS 包，并在同一仓库的草稿 Release 中生成和验证 `latest.json`。
-5. 元数据验证通过后工作流才公开 Release。客户端通过内置线路访问该文件，按语义版本提示更新。
+5. 元数据验证通过后工作流才公开 Release。客户端通过内置网络通道访问该文件，按语义版本提示更新。
 
-发布工作流会把 updater 元数据中的 GitHub API asset 地址改写为同一仓库的公开 Release 直链，避免所有用户共用 VLESS 出口时共享匿名 API 频率限制。
+发布工作流会把 updater 元数据中的 GitHub API asset 地址改写为同一仓库的公开 Release 直链，避免共享出口带来的匿名 API 频率限制。
 
 更新器使用独立的 Tauri/minisign 签名验证包内容。代码签名（Authenticode）是另一层机制，正式广泛分发前仍建议购买证书以减少 Windows SmartScreen 提示。
 
@@ -87,13 +84,12 @@ Updater 私钥一旦丢失，就无法再给已安装客户端发布可验证的
 GitHub Actions 和本地打包脚本会下载并校验：
 
 - Xray-core `v26.3.27`
-- OpenAI Codex installer commit `6219b7c40fc9c702c0aef9964e72b492558f60e4`
 
 ## 安全边界
 
-桌面程序中的固定 VLESS 链接无法真正保密：发布后的 EXE 和运行内存都可以被用户分析。构建 Secret 能防止链接进入 Git 历史，但不能保护发布包中的共享凭据。后续若用户规模扩大，应改为服务端签发单设备、可撤销、有限额的线路。
+桌面程序中的固定网络凭据无法真正保密：发布后的 EXE 和运行内存都可以被分析。后续若用户规模扩大，应改为服务端签发单设备、可撤销、有限额的凭据。
 
-线路和 GitHub Token 都不应写入源码、`.env`、Actions 日志或 issue。已经在聊天中发送过的凭据应轮换。
+网络凭据和 GitHub Token 都不应出现在 Actions 日志或 issue。已经公开发送过的凭据应及时轮换。
 
 ## 数据读取范围
 

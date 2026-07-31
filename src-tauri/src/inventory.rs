@@ -126,28 +126,13 @@ impl std::fmt::Display for ProcessError {
     }
 }
 
-/// Collects all local Codex information without entering an async runtime.
-///
-/// The function performs bounded subprocess calls and is intended to be called
-/// through `spawn_blocking` from an async Tauri command.
+/// Collects local Codex desktop state and its shared local inventory.
 pub fn collect_inventory() -> Inventory {
     let codex_home = resolve_codex_home();
-    let (codex, executable, mut warnings) = detect_codex();
+    let (codex, warnings) = detect_codex();
 
     let filesystem_plugins = scan_plugin_manifests(&codex_home);
-
-    let cli_plugins = executable
-        .as_deref()
-        .and_then(|path| match list_plugins_with_cli(path) {
-            Ok(plugins) => Some(plugins),
-            Err(error) => {
-                warnings.push(format!("Unable to query Codex plugins: {error}"));
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    let plugins = merge_plugins(cli_plugins, filesystem_plugins);
+    let plugins = deduplicate_plugins(filesystem_plugins);
     let plugin_roots = plugin_roots_from(&plugins);
     let skills = scan_skills(&codex_home, &plugin_roots);
 
@@ -160,7 +145,7 @@ pub fn collect_inventory() -> Inventory {
     }
 }
 
-/// Detects only the Codex executable and version.
+/// Detects the official Microsoft Store Codex Windows desktop package.
 pub fn detect_codex_status() -> CodexStatus {
     detect_codex().0
 }
@@ -180,67 +165,87 @@ fn resolve_codex_home_from(explicit: Option<OsString>, home: Option<PathBuf>) ->
     home.unwrap_or_else(|| PathBuf::from(".")).join(".codex")
 }
 
-fn detect_codex() -> (CodexStatus, Option<PathBuf>, Vec<String>) {
-    let candidates = executable_candidates();
-    if candidates.is_empty() {
-        return (
-            CodexStatus {
-                installed: false,
-                path: None,
-                version: None,
-                source: None,
-            },
-            None,
-            Vec::new(),
-        );
-    }
-
-    let mut failures = Vec::new();
-    for candidate in candidates {
-        match run_codex_process(&candidate.path, &["--version"], VERSION_TIMEOUT) {
-            Ok(output) if output.success => {
-                let version = first_nonempty_line(&output.stdout)
-                    .or_else(|| first_nonempty_line(&output.stderr));
-                let path = path_to_string(&candidate.path);
-                return (
-                    CodexStatus {
-                        installed: true,
-                        path: Some(path),
-                        version,
-                        source: Some(candidate.detected_via.to_owned()),
-                    },
-                    Some(candidate.path),
-                    Vec::new(),
-                );
+fn detect_codex() -> (CodexStatus, Vec<String>) {
+    #[cfg(windows)]
+    {
+        const QUERY: &str = "Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue | Select-Object @{Name='Version';Expression={$_.Version.ToString()}},InstallLocation,@{Name='Status';Expression={$_.Status.ToString()}} | ConvertTo-Json -Compress";
+        match run_process(
+            Path::new("powershell.exe"),
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                QUERY,
+            ],
+            VERSION_TIMEOUT,
+        ) {
+            Ok(output) if output.success && !output.stdout.trim().is_empty() => {
+                match serde_json::from_str::<StorePackage>(&output.stdout) {
+                    Ok(package) => {
+                        let mut warnings = Vec::new();
+                        if package
+                            .status
+                            .as_deref()
+                            .is_some_and(|status| !status.eq_ignore_ascii_case("ok"))
+                        {
+                            warnings.push("Codex Windows 桌面端的 Microsoft Store 包状态异常，请在 Microsoft Store 中修复或重新安装".to_owned());
+                        }
+                        return (
+                            CodexStatus {
+                                installed: true,
+                                path: package
+                                    .install_location
+                                    .map(PathBuf::from)
+                                    .as_deref()
+                                    .map(path_to_string),
+                                version: package.version,
+                                source: Some("Microsoft Store".to_owned()),
+                            },
+                            warnings,
+                        );
+                    }
+                    Err(_) => {
+                        return (
+                            missing_codex_status(),
+                            vec!["无法读取 Codex Windows 桌面端的安装信息".to_owned()],
+                        )
+                    }
+                }
             }
-            Ok(output) => failures.push(format!(
-                "{} exited with {}{}",
-                candidate.path.display(),
-                output
-                    .code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "an unknown status".to_owned()),
-                concise_stderr(&output.stderr)
-            )),
-            Err(error) => failures.push(format!("{}: {error}", candidate.path.display())),
+            Ok(_) => return (missing_codex_status(), Vec::new()),
+            Err(_) => {
+                return (
+                    missing_codex_status(),
+                    vec!["无法查询 Microsoft Store 应用状态".to_owned()],
+                )
+            }
         }
     }
 
-    (
-        CodexStatus {
-            installed: false,
-            path: None,
-            version: None,
-            source: None,
-        },
-        None,
-        vec![format!(
-            "Codex CLI candidates could not be started: {}",
-            failures.join("; ")
-        )],
-    )
+    #[cfg(not(windows))]
+    (missing_codex_status(), Vec::new())
 }
 
+fn missing_codex_status() -> CodexStatus {
+    CodexStatus {
+        installed: false,
+        path: None,
+        version: None,
+        source: None,
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct StorePackage {
+    version: Option<String>,
+    install_location: Option<String>,
+    status: Option<String>,
+}
+
+#[allow(dead_code)]
 fn executable_candidates() -> Vec<ExecutableCandidate> {
     let mut candidates = Vec::new();
 
@@ -436,6 +441,7 @@ fn concise_stderr(stderr: &str) -> String {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn list_plugins_with_cli(executable: &Path) -> Result<Vec<PluginItem>, String> {
     let output = run_codex_process(
         executable,

@@ -172,10 +172,6 @@ pub fn parse_vless_uri(raw: &str) -> Result<VlessEndpoint, String> {
     })
 }
 
-pub fn xray_available(app: &AppHandle) -> bool {
-    find_xray(app).is_some_and(|executable| verify_xray(&executable).is_ok())
-}
-
 pub fn start(app: &AppHandle, uri: &str) -> Result<ProxyRuntime, String> {
     let endpoint = parse_vless_uri(uri)?;
     let executable = find_xray(app).ok_or_else(|| "安装包中缺少 Xray 核心".to_owned())?;

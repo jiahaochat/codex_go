@@ -1,23 +1,19 @@
 use std::{
-    fs::{self, File},
+    fs::File,
     io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 use crate::{inventory, process_guard::ChildJob, proxy, secrets};
 
-const INSTALLER_SHA256: &str = "391f247de2c70c7e99041979ec02dae7e76be27ac9cfc1dfe7c1eb21d48d8b97";
-const MAX_INSTALLER_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_INSTALL_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+const STORE_PRODUCT_ID: &str = "9PLM9XGG6VKS";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,148 +23,107 @@ pub struct InstallProgress {
     pub message: String,
 }
 
+/// Installs the official Codex Windows desktop app from Microsoft Store.
 pub fn install(app: &AppHandle) -> Result<(), String> {
-    emit(app, "preparing", 4, "正在检查安装环境");
-    let script = find_installer(app).ok_or_else(|| "安装包中缺少官方 Codex 安装脚本".to_owned())?;
-    verify_installer(&script)?;
-    let resolved =
-        secrets::resolve_vless_uri()?.ok_or_else(|| "请先配置 VLESS 下载线路".to_owned())?;
+    if inventory::detect_codex_status().installed {
+        return update(app);
+    }
 
-    emit(app, "proxy", 16, "正在启动本机加速线路");
-    let runtime = proxy::start(app, &resolved.uri)?;
-    emit(app, "downloading", 38, "正在通过加速线路获取官方文件");
+    emit(app, "preparing", 4, "正在检查 Windows App Installer");
+    run_winget(app, "install", "正在安装官方 Codex Windows 桌面端")
+}
 
-    let command = build_powershell_command(&script, &runtime);
-    emit(app, "installing", 58, "正在安装 Codex CLI");
-    let output = run_powershell(&command, &runtime.url)?;
-    if !output.status.success() {
-        let detail = safe_process_error(&output.stdout, &output.stderr, &runtime);
+/// Updates the official Codex Windows desktop app to the newest Store release.
+pub fn update(app: &AppHandle) -> Result<(), String> {
+    emit(app, "preparing", 4, "正在检查 Codex Windows 更新");
+    run_winget(app, "upgrade", "正在更新官方 Codex Windows 桌面端")
+}
+
+fn run_winget(app: &AppHandle, action: &str, action_message: &str) -> Result<(), String> {
+    let uri = secrets::vless_uri()?;
+    let runtime = proxy::start(app, uri)?;
+    emit(
+        app,
+        "downloading",
+        28,
+        "正在通过 Microsoft Store 获取最新稳定版",
+    );
+    emit(app, "installing", 55, action_message);
+    let output = run_winget_command(action, &runtime)?;
+
+    if !output.status.success() && !is_already_current(&output) {
+        let detail = process_error(&output, &runtime);
+        if detail.contains("winget.exe") || detail.contains("系统找不到指定的文件") {
+            return Err("未找到 Windows App Installer（winget）。请先在 Microsoft Store 更新“应用安装程序”后重试".to_owned());
+        }
         return Err(if detail.is_empty() {
-            "Codex 官方安装程序执行失败".to_owned()
+            "Microsoft Store 未能完成 Codex 安装或更新".to_owned()
         } else {
-            format!("Codex 官方安装程序执行失败: {detail}")
+            format!("Microsoft Store 未能完成 Codex 安装或更新: {detail}")
         });
     }
 
-    emit(app, "verifying", 92, "正在验证 Codex 命令");
+    emit(app, "verifying", 92, "正在验证 Codex Windows 桌面端");
     let status = inventory::detect_codex_status();
     if !status.installed {
-        return Err("安装程序已结束，但未能找到 codex 命令；请重新打开应用后刷新".to_owned());
+        return Err("Microsoft Store 任务已结束，但尚未检测到 Codex 桌面端。请稍候刷新，或在 Microsoft Store 中完成安装".to_owned());
     }
-    emit(app, "complete", 100, "Codex 安装完成");
+    emit(app, "complete", 100, "Codex Windows 桌面端已是最新版本");
     Ok(())
 }
 
-fn emit(app: &AppHandle, stage: &str, percent: u8, message: &str) {
-    let _ = app.emit(
-        "install-progress",
-        InstallProgress {
-            stage: stage.to_owned(),
-            percent,
-            message: message.to_owned(),
-        },
-    );
-}
-
-fn find_installer(app: &AppHandle) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CODEX_GO_INSTALLER_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let mut candidates = Vec::new();
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.push(resource_dir.join("resources/codex/install.ps1"));
-        candidates.push(resource_dir.join("codex/install.ps1"));
-    }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/codex/install.ps1"));
-    candidates.into_iter().find(|path| path.is_file())
-}
-
-fn verify_installer(path: &Path) -> Result<(), String> {
-    let metadata = path
-        .metadata()
-        .map_err(|_| "无法读取官方 Codex 安装脚本".to_owned())?;
-    if metadata.len() == 0 || metadata.len() > MAX_INSTALLER_BYTES {
-        return Err("官方 Codex 安装脚本大小异常".to_owned());
-    }
-    let bytes = fs::read(path).map_err(|_| "无法读取官方 Codex 安装脚本".to_owned())?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
-    if actual != INSTALLER_SHA256 {
-        return Err("官方 Codex 安装脚本校验失败".to_owned());
-    }
-    Ok(())
-}
-
-fn build_powershell_command(script: &Path, runtime: &proxy::ProxyRuntime) -> String {
-    let script = quote_powershell(&script.to_string_lossy());
-    let address = quote_powershell(&runtime.address);
-    let username = quote_powershell(&runtime.username);
-    let password = quote_powershell(&runtime.password);
-    let url = quote_powershell(&runtime.url);
-    format!(
-        "$ErrorActionPreference='Stop';\
-         $proxy='{address}';\
-         $proxyPassword=ConvertTo-SecureString '{password}' -AsPlainText -Force;\
-         $proxyCredential=New-Object System.Management.Automation.PSCredential('{username}',$proxyPassword);\
-         $PSDefaultParameterValues['Invoke-WebRequest:Proxy']=$proxy;\
-         $PSDefaultParameterValues['Invoke-WebRequest:ProxyCredential']=$proxyCredential;\
-         $PSDefaultParameterValues['Invoke-RestMethod:Proxy']=$proxy;\
-         $PSDefaultParameterValues['Invoke-RestMethod:ProxyCredential']=$proxyCredential;\
-         $env:HTTP_PROXY='{url}';\
-         $env:HTTPS_PROXY='{url}';\
-         $env:NO_PROXY='localhost,127.0.0.1';\
-         $env:CODEX_NON_INTERACTIVE='1';\
-         & '{script}'"
-    )
-}
-
-fn run_powershell(command: &str, proxy_url: &str) -> Result<Output, String> {
-    let executable = powershell_path();
-    let encoded = encode_powershell(command);
-    let mut stdout_file = tempfile::tempfile().map_err(|_| "无法准备安装日志".to_owned())?;
-    let mut stderr_file = tempfile::tempfile().map_err(|_| "无法准备安装日志".to_owned())?;
+fn run_winget_command(action: &str, runtime: &proxy::ProxyRuntime) -> Result<Output, String> {
+    let mut stdout_file =
+        tempfile::tempfile().map_err(|_| "无法准备 Microsoft Store 日志".to_owned())?;
+    let mut stderr_file =
+        tempfile::tempfile().map_err(|_| "无法准备 Microsoft Store 日志".to_owned())?;
     let child_stdout = stdout_file
         .try_clone()
-        .map_err(|_| "无法准备安装日志".to_owned())?;
+        .map_err(|_| "无法准备 Microsoft Store 日志".to_owned())?;
     let child_stderr = stderr_file
         .try_clone()
-        .map_err(|_| "无法准备安装日志".to_owned())?;
-    let mut process = Command::new(executable);
-    process
+        .map_err(|_| "无法准备 Microsoft Store 日志".to_owned())?;
+
+    let mut command = Command::new("winget.exe");
+    command
         .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            &encoded,
+            action,
+            "--id",
+            STORE_PRODUCT_ID,
+            "--exact",
+            "--source",
+            "msstore",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
         ])
-        .env("HTTP_PROXY", proxy_url)
-        .env("HTTPS_PROXY", proxy_url)
+        .arg("--proxy")
+        .arg(&runtime.url)
+        .env("HTTP_PROXY", &runtime.url)
+        .env("HTTPS_PROXY", &runtime.url)
+        .env("ALL_PROXY", &runtime.url)
         .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("CODEX_NON_INTERACTIVE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr));
-    hide_window(&mut process);
-    let mut child = process
+    hide_window(&mut command);
+
+    let mut child = command
         .spawn()
-        .map_err(|_| "无法启动 Windows PowerShell".to_owned())?;
-    let _job = ChildJob::attach(&mut child).map_err(|_| "无法约束 Codex 安装进程".to_owned())?;
+        .map_err(|error| format!("无法启动 winget.exe: {error}"))?;
+    let _job =
+        ChildJob::attach(&mut child).map_err(|_| "无法约束 Microsoft Store 安装进程".to_owned())?;
     let deadline = Instant::now() + INSTALL_TIMEOUT;
     let status = loop {
         match child
             .try_wait()
-            .map_err(|_| "无法读取 Codex 安装状态".to_owned())?
+            .map_err(|_| "无法读取 Microsoft Store 安装状态".to_owned())?
         {
             Some(status) => break status,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Codex 安装超过 30 分钟，任务已停止".to_owned());
+                return Err("Codex Windows 桌面端安装或更新超过 30 分钟，任务已停止".to_owned());
             }
             None => thread::sleep(Duration::from_millis(100)),
         }
@@ -183,48 +138,52 @@ fn run_powershell(command: &str, proxy_url: &str) -> Result<Output, String> {
 
 fn read_process_output(file: &mut File) -> Result<Vec<u8>, String> {
     file.seek(SeekFrom::Start(0))
-        .map_err(|_| "无法读取安装日志".to_owned())?;
+        .map_err(|_| "无法读取 Microsoft Store 日志".to_owned())?;
     let mut bytes = Vec::new();
-    file.take(MAX_INSTALL_OUTPUT_BYTES)
+    file.take(MAX_OUTPUT_BYTES)
         .read_to_end(&mut bytes)
-        .map_err(|_| "无法读取安装日志".to_owned())?;
+        .map_err(|_| "无法读取 Microsoft Store 日志".to_owned())?;
     Ok(bytes)
 }
 
-fn powershell_path() -> PathBuf {
-    if let Ok(system_root) = std::env::var("SystemRoot") {
-        let candidate =
-            PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        if candidate.is_file() {
-            return candidate;
-        }
+fn is_already_current(output: &Output) -> bool {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_lowercase();
+    text.contains("no applicable update found") || text.contains("没有适用的更新")
+}
+
+fn process_error(output: &Output, runtime: &proxy::ProxyRuntime) -> String {
+    let mut detail = if output.stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout)
+    } else {
+        String::from_utf8_lossy(&output.stderr)
     }
-    PathBuf::from("powershell.exe")
-}
-
-fn quote_powershell(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-fn encode_powershell(command: &str) -> String {
-    let bytes: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    STANDARD.encode(bytes)
-}
-
-fn safe_process_error(stdout: &[u8], stderr: &[u8], runtime: &proxy::ProxyRuntime) -> String {
-    let mut detail = String::from_utf8_lossy(stderr).trim().to_owned();
-    if detail.is_empty() {
-        detail = String::from_utf8_lossy(stdout).trim().to_owned();
-    }
+    .trim()
+    .to_owned();
     for secret in [
         &runtime.url,
         &runtime.address,
         &runtime.username,
         &runtime.password,
     ] {
-        detail = detail.replace(secret, "[本机代理]");
+        detail = detail.replace(secret, "[本机网络服务]");
     }
     detail.chars().take(1200).collect()
+}
+
+fn emit(app: &AppHandle, stage: &str, percent: u8, message: &str) {
+    let _ = app.emit(
+        "install-progress",
+        InstallProgress {
+            stage: stage.to_owned(),
+            percent,
+            message: message.to_owned(),
+        },
+    );
 }
 
 #[cfg(windows)]
@@ -235,27 +194,3 @@ fn hide_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_window(_command: &mut Command) {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn powershell_encoding_is_utf16le_base64() {
-        let encoded = encode_powershell("Write-Output 'ok'");
-        let decoded = STANDARD.decode(encoded).unwrap();
-        let words: Vec<u16> = decoded
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
-        assert_eq!(String::from_utf16(&words).unwrap(), "Write-Output 'ok'");
-    }
-
-    #[test]
-    fn powershell_quote_doubles_single_quotes() {
-        assert_eq!(
-            quote_powershell("C:\\Users\\O'Brien\\a.ps1"),
-            "C:\\Users\\O''Brien\\a.ps1"
-        );
-    }
-}

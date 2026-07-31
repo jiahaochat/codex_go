@@ -1,4 +1,4 @@
 fn main() {
-    println!("cargo:rerun-if-env-changed=CODEX_GO_DEFAULT_VLESS_URI");
+    println!("cargo:rerun-if-changed=icons/icon.ico");
     tauri_build::build()
 }

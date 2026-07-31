@@ -6,8 +6,11 @@ export default defineConfig({
   clearScreen: false,
   server: {
     host: "127.0.0.1",
-    port: 1420,
+    port: 3000,
     strictPort: true,
+    watch: {
+      ignored: ["**/src-tauri/target/**"],
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
 });

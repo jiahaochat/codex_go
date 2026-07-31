@@ -59,8 +59,6 @@ jobs:
         run: ./scripts/prepare-windows-assets.ps1
 
       - name: Verify Rust backend
-        env:
-          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
         run: |
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
           cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
@@ -70,12 +68,10 @@ jobs:
         if: github.event_name != 'pull_request'
         shell: powershell
         env:
-          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           $required = @(
-            'CODEX_GO_DEFAULT_VLESS_URI',
             'TAURI_SIGNING_PRIVATE_KEY',
             'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'
           )
@@ -88,7 +84,6 @@ jobs:
       - name: Build NSIS installer
         if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
         env:
-          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- -- --locked
@@ -152,7 +147,6 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:

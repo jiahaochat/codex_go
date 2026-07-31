@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-export type InventorySource = "command" | "filesystem" | "config" | "marketplace";
+export type InventorySource = "filesystem" | "config" | "marketplace";
 
 export interface CodexStatus {
   installed: boolean;
@@ -33,19 +33,12 @@ export interface SkillItem {
   error: string | null;
 }
 
-export interface ProxyStatus {
-  configured: boolean;
-  coreAvailable: boolean;
-  source: "environment" | "build" | "none";
-}
-
 export interface AppSnapshot {
   appVersion: string;
   codex: CodexStatus;
   codexHome: string;
   plugins: PluginItem[];
   skills: SkillItem[];
-  proxy: ProxyStatus;
   warnings: string[];
   checkedAt: string;
 }
@@ -73,9 +66,9 @@ const previewSnapshot: AppSnapshot = {
   appVersion: "0.1.0",
   codex: {
     installed: true,
-    path: "C:\\Users\\jiahao\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
-    version: "0.135.0",
-    source: "官方独立安装",
+    path: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.721.4979.0_x64__2p2nqsd0c76g0",
+    version: "26.721.4979.0",
+    source: "Microsoft Store",
   },
   codexHome: "C:\\Users\\jiahao\\.codex",
   plugins: [
@@ -87,7 +80,7 @@ const previewSnapshot: AppSnapshot = {
       enabled: true,
       marketplace: "personal",
       path: "C:\\Users\\jiahao\\.codex\\plugins\\cache\\personal\\openai-developer-docs\\1.4.2",
-      source: "command",
+      source: "filesystem",
       error: null,
     },
     {
@@ -98,7 +91,7 @@ const previewSnapshot: AppSnapshot = {
       enabled: false,
       marketplace: "workspace",
       path: "C:\\Users\\jiahao\\.codex\\plugins\\cache\\workspace\\team-review\\0.8.0",
-      source: "command",
+      source: "filesystem",
       error: null,
     },
   ],
@@ -134,7 +127,6 @@ const previewSnapshot: AppSnapshot = {
       error: null,
     },
   ],
-  proxy: { configured: true, coreAvailable: true, source: "build" },
   warnings: [],
   checkedAt: new Date().toISOString(),
 };
@@ -159,6 +151,11 @@ export async function refreshSnapshot(): Promise<AppSnapshot> {
 export async function installCodex(): Promise<void> {
   if (!isTauri()) return;
   await invoke("install_codex");
+}
+
+export async function updateCodex(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("update_codex");
 }
 
 export async function revealPath(path: string): Promise<void> {

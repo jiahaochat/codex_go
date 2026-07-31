@@ -5,27 +5,32 @@ import {
   ChevronRight,
   CircleAlert,
   CloudDownload,
+  Copy,
   Download,
   FolderOpen,
   Gauge,
   Layers3,
   LoaderCircle,
+  Minus,
   PackageCheck,
   Plug,
   RefreshCw,
-  Route,
   Search,
   Settings2,
   ShieldCheck,
+  Square,
   Sparkles,
   TerminalSquare,
   X,
 } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import codexGoIcon from "../assets/codex-go-icon.png";
 import {
   checkAppUpdate,
   getSnapshot,
   installAppUpdate,
   installCodex,
+  updateCodex,
   onAppUpdateProgress,
   onInstallProgress,
   refreshSnapshot,
@@ -48,7 +53,6 @@ type View = "overview" | "plugins" | "skills" | "settings";
 type StatusTone = "success" | "warning" | "neutral";
 
 const sourceLabels = {
-  command: "Codex CLI",
   filesystem: "本地目录",
   config: "配置文件",
   marketplace: "插件市场",
@@ -146,20 +150,18 @@ function App() {
     return () => dispose?.();
   }, [load]);
 
-  const startInstall = async () => {
+  const startCodexAction = async () => {
     if (updating) {
       setInstallError("请等待软件更新任务结束");
       return;
     }
-    if (!snapshot?.proxy.configured) {
-      setError("当前发布包未内置加速线路，请重新下载安装包");
-      return;
-    }
     setInstallError(null);
     setInstalling(true);
-    setProgress({ stage: "preparing", percent: 4, message: "正在准备安装环境" });
+    const isUpdate = snapshot?.codex.installed;
+    setProgress({ stage: "preparing", percent: 4, message: isUpdate ? "正在检查 Codex Windows 更新" : "正在准备 Codex Windows 安装" });
     try {
-      await installCodex();
+      if (isUpdate) await updateCodex();
+      else await installCodex();
     } catch (reason) {
       const message = errorMessage(reason);
       setInstalling(false);
@@ -175,7 +177,7 @@ function App() {
     }
     setUpdating(true);
     setUpdateError(null);
-    setUpdateProgress({ stage: "proxy", percent: 3, message: "正在准备更新线路" });
+    setUpdateProgress({ stage: "proxy", percent: 3, message: "正在准备更新" });
     try {
       await installAppUpdate();
     } catch (reason) {
@@ -194,75 +196,141 @@ function App() {
   }[view];
 
   return (
-    <div className="app-shell">
-      <Sidebar view={view} onChange={setView} snapshot={snapshot} />
-      <main className="main-panel">
-        <header className="topbar">
-          <div>
-            <p className="eyebrow">本机 Codex 管理</p>
-            <h1>{title}</h1>
-          </div>
-          <div className="topbar-actions">
-            {snapshot && <span className="checked-at">更新于 {formatTime(snapshot.checkedAt)}</span>}
-            <button
-              className="icon-button"
-              type="button"
-              title="刷新本机状态"
-              aria-label="刷新本机状态"
-              disabled={refreshing}
-              onClick={() => void load(true)}
-            >
-              <RefreshCw size={18} className={refreshing ? "spin" : undefined} />
-            </button>
-          </div>
-        </header>
+    <div className="app-frame">
+      <WindowTitlebar />
+      <div className="app-shell">
+        <Sidebar view={view} onChange={setView} snapshot={snapshot} />
+        <main className="main-panel">
+          <header className="topbar">
+            <div>
+              <p className="eyebrow">本机 Codex 管理</p>
+              <h1>{title}</h1>
+            </div>
+            <div className="topbar-actions">
+              {snapshot && <span className="checked-at">更新于 {formatTime(snapshot.checkedAt)}</span>}
+              <button
+                className="icon-button"
+                type="button"
+                title="刷新本机状态"
+                aria-label="刷新本机状态"
+                disabled={refreshing}
+                onClick={() => void load(true)}
+              >
+                <RefreshCw size={18} className={refreshing ? "spin" : undefined} />
+              </button>
+            </div>
+          </header>
 
-        <div className="content">
-          {loading && !snapshot ? <LoadingState /> : null}
-          {error ? <ErrorBanner message={error} onRetry={() => void load(true)} /> : null}
-          {availableUpdate && !updateDismissed ? (
-            <UpdateBanner
-              update={availableUpdate}
-              updating={updating}
-              blocked={installing}
-              progress={updateProgress}
-              onInstall={() => void startAppUpdate()}
-              onDismiss={() => setUpdateDismissed(true)}
-            />
-          ) : null}
-          {installError ? <ErrorBanner message={installError} onRetry={() => void startInstall()} /> : null}
-          {updateError ? <ErrorBanner message={updateError} onRetry={() => void checkUpdates(true)} /> : null}
-          {snapshot && view === "overview" ? (
-            <Overview
-              snapshot={snapshot}
-              installing={installing}
-              operationBusy={installing || updating}
-              progress={progress}
-              onInstall={() => void startInstall()}
-              onNavigate={setView}
-            />
-          ) : null}
-          {snapshot && view === "plugins" ? <PluginInventory items={snapshot.plugins} /> : null}
-          {snapshot && view === "skills" ? <SkillInventory items={snapshot.skills} /> : null}
-          {snapshot && view === "settings" ? (
-            <SettingsView
-              snapshot={snapshot}
-              installing={installing}
-              operationBusy={installing || updating}
-              progress={progress}
-              onInstall={() => void startInstall()}
-              update={availableUpdate}
-              updateProgress={updateProgress}
-              checkingUpdate={checkingUpdate}
-              updateChecked={updateChecked}
-              updating={updating}
-              onCheckUpdate={() => void checkUpdates(true)}
-              onInstallUpdate={() => void startAppUpdate()}
-            />
-          ) : null}
-        </div>
-      </main>
+          <div className="content">
+            {loading && !snapshot ? <LoadingState /> : null}
+            {error ? <ErrorBanner message={error} onRetry={() => void load(true)} /> : null}
+            {availableUpdate && !updateDismissed ? (
+              <UpdateBanner
+                update={availableUpdate}
+                updating={updating}
+                blocked={installing}
+                progress={updateProgress}
+                onInstall={() => void startAppUpdate()}
+                onDismiss={() => setUpdateDismissed(true)}
+              />
+            ) : null}
+            {installError ? <ErrorBanner message={installError} onRetry={() => void startCodexAction()} /> : null}
+            {updateError ? <ErrorBanner message={updateError} onRetry={() => void checkUpdates(true)} /> : null}
+            {snapshot && view === "overview" ? (
+              <Overview
+                snapshot={snapshot}
+                installing={installing}
+                operationBusy={installing || updating}
+                progress={progress}
+                onInstall={() => void startCodexAction()}
+                onNavigate={setView}
+              />
+            ) : null}
+            {snapshot && view === "plugins" ? <PluginInventory items={snapshot.plugins} /> : null}
+            {snapshot && view === "skills" ? <SkillInventory items={snapshot.skills} /> : null}
+            {snapshot && view === "settings" ? (
+              <SettingsView
+                snapshot={snapshot}
+                installing={installing}
+                operationBusy={installing || updating}
+                progress={progress}
+                onInstall={() => void startCodexAction()}
+                update={availableUpdate}
+                updateProgress={updateProgress}
+                checkingUpdate={checkingUpdate}
+                updateChecked={updateChecked}
+                updating={updating}
+                onCheckUpdate={() => void checkUpdates(true)}
+                onInstallUpdate={() => void startAppUpdate()}
+              />
+            ) : null}
+          </div>
+        </main>
+      </div>
     </div>
+  );
+}
+
+function WindowTitlebar() {
+  const [maximized, setMaximized] = useState(false);
+  const tauriRuntime = "__TAURI_INTERNALS__" in window;
+  const appWindow = useMemo(() => tauriRuntime ? getCurrentWindow() : null, [tauriRuntime]);
+
+  useEffect(() => {
+    if (!appWindow) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const syncMaximized = () => {
+      void appWindow.isMaximized().then((value) => {
+        if (!disposed) setMaximized(value);
+      });
+    };
+
+    syncMaximized();
+    void appWindow.onResized(syncMaximized).then((next) => {
+      if (disposed) next();
+      else unlisten = next;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [appWindow]);
+
+  const run = (command: () => Promise<void>) => {
+    if (appWindow) void command();
+  };
+
+  return (
+    <header className="window-titlebar" data-tauri-drag-region>
+      <div className="titlebar-brand" data-tauri-drag-region>
+        <img src={codexGoIcon} alt="" aria-hidden="true" />
+        <strong data-tauri-drag-region>codex_go</strong>
+      </div>
+      <div
+        className="titlebar-drag-area"
+        data-tauri-drag-region
+        onDoubleClick={() => appWindow && run(() => appWindow.toggleMaximize())}
+      />
+      <div className="window-controls">
+        <button type="button" title="最小化" aria-label="最小化窗口" onClick={() => appWindow && run(() => appWindow.minimize())}>
+          <Minus size={16} strokeWidth={1.7} />
+        </button>
+        <button
+          type="button"
+          title={maximized ? "还原" : "最大化"}
+          aria-label={maximized ? "还原窗口" : "最大化窗口"}
+          onClick={() => appWindow && run(() => appWindow.toggleMaximize())}
+        >
+          {maximized ? <Copy size={13} strokeWidth={1.5} /> : <Square size={13} strokeWidth={1.5} />}
+        </button>
+        <button className="window-close" type="button" title="关闭" aria-label="关闭窗口" onClick={() => appWindow && run(() => appWindow.close())}>
+          <X size={17} strokeWidth={1.7} />
+        </button>
+      </div>
+    </header>
   );
 }
 
@@ -284,16 +352,6 @@ function Sidebar({
 
   return (
     <aside className="sidebar">
-      <div className="brand">
-        <div className="brand-mark" aria-hidden="true">
-          <span>&gt;</span>
-          <i />
-        </div>
-        <div>
-          <strong>codex_go</strong>
-          <span>Windows</span>
-        </div>
-      </div>
       <nav aria-label="主要导航">
         {navigation.map(({ id, label, icon: Icon, count }) => (
           <button
@@ -372,14 +430,6 @@ function Overview({
           accent="amber"
           onClick={() => onNavigate("skills")}
         />
-        <Metric
-          icon={Route}
-          label="下载线路"
-          value={snapshot.proxy.configured ? "已内置" : "构建缺失"}
-          detail={snapshot.proxy.coreAvailable ? "Xray 核心可用" : "缺少 Xray 核心"}
-          accent="green"
-          onClick={() => onNavigate("settings")}
-        />
       </section>
 
       <section className="section-block">
@@ -433,19 +483,19 @@ function CodexHero({
       </div>
       <div className="hero-copy">
         <div className="hero-title-line">
-          <h2>{installed ? "Codex 已安装" : "尚未安装 Codex"}</h2>
+          <h2>{installed ? "Codex Windows 桌面端已安装" : "尚未安装 Codex Windows 桌面端"}</h2>
           <StatusPill tone={installed ? "success" : "warning"}>
             {installed ? snapshot.codex.version ?? "版本未知" : "需要安装"}
           </StatusPill>
         </div>
         <p>
           {installed
-            ? snapshot.codex.path ?? "已通过系统命令识别 Codex"
-            : "使用加速线路获取 OpenAI 官方 Windows 安装包。"}
+            ? snapshot.codex.path ?? "已通过 Microsoft Store 识别 Codex Windows 桌面端"
+            : "从 Microsoft Store 安装 OpenAI 官方 Codex Windows 桌面端。"}
         </p>
         <div className="hero-meta">
           <span><FolderOpen size={15} /> {snapshot.codexHome}</span>
-          <span><ShieldCheck size={15} /> {snapshot.proxy.configured ? "安装线路已配置" : "安装线路待配置"}</span>
+          <span><ShieldCheck size={15} /> Microsoft Store 官方分发</span>
         </div>
         {installing && progress ? (
           <div className="install-progress" aria-live="polite">
@@ -455,21 +505,10 @@ function CodexHero({
         ) : null}
       </div>
       <div className="hero-action">
-        {installed ? (
-          <button
-            className="secondary-command"
-            type="button"
-            onClick={() => snapshot.codex.path && void revealPath(snapshot.codex.path)}
-            disabled={!snapshot.codex.path}
-          >
-            <FolderOpen size={17} /> 打开位置
-          </button>
-        ) : (
-          <button className="primary-command" type="button" onClick={onInstall} disabled={operationBusy}>
-            {installing ? <LoaderCircle size={17} className="spin" /> : <Download size={17} />}
-            {installing ? "正在安装" : "安装 Codex"}
-          </button>
-        )}
+        <button className="primary-command" type="button" onClick={onInstall} disabled={operationBusy}>
+          {installing ? <LoaderCircle size={17} className="spin" /> : <Download size={17} />}
+          {installing ? (installed ? "正在更新" : "正在安装") : (installed ? "更新到最新版" : "安装 Codex")}
+        </button>
       </div>
     </section>
   );
@@ -635,20 +674,24 @@ function SettingsView({
       <section className="settings-section">
         <div className="settings-heading">
           <div className="settings-icon"><TerminalSquare size={20} /></div>
-          <div><h2>Codex CLI</h2><p>官方独立安装与本机检测</p></div>
+          <div><h2>Codex Windows 桌面端</h2><p>Microsoft Store 官方安装与本机检测</p></div>
         </div>
         <dl className="details-list">
           <div><dt>状态</dt><dd><StatusPill tone={snapshot.codex.installed ? "success" : "warning"}>{snapshot.codex.installed ? "已安装" : "未安装"}</StatusPill></dd></div>
           <div><dt>版本</dt><dd>{snapshot.codex.version ?? "-"}</dd></div>
-          <div><dt>命令位置</dt><dd className="path-value">{snapshot.codex.path ?? "未检测到"}</dd></div>
+          <div><dt>安装位置</dt><dd className="path-value">{snapshot.codex.path ?? "未检测到"}</dd></div>
+          <div><dt>分发渠道</dt><dd>{snapshot.codex.source ?? "-"}</dd></div>
           <div><dt>CODEX_HOME</dt><dd className="path-value">{snapshot.codexHome}</dd></div>
         </dl>
-        {!snapshot.codex.installed ? (
-          <button className="primary-command" type="button" onClick={onInstall} disabled={operationBusy}>
-            {installing ? <LoaderCircle size={17} className="spin" /> : <Download size={17} />}
-            {installing ? progress?.message ?? "正在安装" : "安装官方 Codex"}
+        <button className="primary-command" type="button" onClick={onInstall} disabled={operationBusy}>
+          {installing ? <LoaderCircle size={17} className="spin" /> : <Download size={17} />}
+          {installing ? (snapshot.codex.installed ? progress?.message ?? "正在更新" : progress?.message ?? "正在安装") : snapshot.codex.installed ? "检查并更新到最新版" : "安装官方 Codex Windows 桌面端"}
+        </button>
+        {!snapshot.codex.installed ? null : (
+          <button className="secondary-command settings-open-path" type="button" onClick={() => snapshot.codex.path && void revealPath(snapshot.codex.path)} disabled={!snapshot.codex.path}>
+            <FolderOpen size={17} /> 打开安装位置
           </button>
-        ) : null}
+        )}
       </section>
 
       <section className="settings-section">
@@ -666,7 +709,6 @@ function SettingsView({
               </StatusPill>
             </dd>
           </div>
-          <div><dt>检查线路</dt><dd>内置 VLESS 加速</dd></div>
           <div><dt>签名校验</dt><dd>强制启用</dd></div>
         </dl>
         {updating && updateProgress ? (
@@ -688,23 +730,6 @@ function SettingsView({
         </div>
       </section>
 
-      <section className="settings-section">
-        <div className="settings-heading">
-          <div className="settings-icon route"><Route size={20} /></div>
-          <div><h2>下载线路</h2><p>仅用于 Codex 安装和更新请求</p></div>
-        </div>
-        <dl className="details-list">
-          <div><dt>VLESS 配置</dt><dd><StatusPill tone={snapshot.proxy.configured ? "success" : "warning"}>{snapshot.proxy.configured ? "已内置" : "构建缺失"}</StatusPill></dd></div>
-          <div><dt>Xray 核心</dt><dd>{snapshot.proxy.coreAvailable ? "可用" : "安装包未包含"}</dd></div>
-          <div><dt>凭据来源</dt><dd>{proxySourceLabel(snapshot.proxy.source)}</dd></div>
-          <div><dt>作用范围</dt><dd>Codex 安装与软件更新</dd></div>
-        </dl>
-      </section>
-
-      <section className="security-strip">
-        <ShieldCheck size={20} />
-        <div><strong>进程级代理</strong><span>本机代理仅监听 127.0.0.1，任务结束后自动关闭，不修改 Windows 系统代理。</span></div>
-      </section>
     </div>
   );
 }
@@ -780,10 +805,6 @@ function errorMessage(reason: unknown): string {
 function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "刚刚" : date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-}
-
-function proxySourceLabel(source: AppSnapshot["proxy"]["source"]): string {
-  return { environment: "开发环境", build: "内置发布配置", none: "无" }[source];
 }
 
 export default App;

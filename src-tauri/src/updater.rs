@@ -40,7 +40,7 @@ pub async fn check(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
         .map_err(|_| "无法初始化软件更新器".to_owned())?
         .check()
         .await
-        .map_err(|_| "无法通过加速线路检查软件更新".to_owned())?;
+        .map_err(|_| "无法检查软件更新".to_owned())?;
 
     Ok(update.map(|update| UpdateInfo {
         current_version: update.current_version,
@@ -51,7 +51,7 @@ pub async fn check(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
 }
 
 pub async fn install(app: AppHandle) -> Result<(), String> {
-    emit(&app, "proxy", 5, "正在连接更新线路");
+    emit(&app, "proxy", 5, "正在准备网络连接");
     let runtime = start_proxy(&app).await?;
     let proxy_url = runtime
         .url
@@ -67,7 +67,7 @@ pub async fn install(app: AppHandle) -> Result<(), String> {
         .map_err(|_| "无法初始化软件更新器".to_owned())?
         .check()
         .await
-        .map_err(|_| "无法通过加速线路检查软件更新".to_owned())?
+        .map_err(|_| "无法检查软件更新".to_owned())?
         .ok_or_else(|| "当前已经是最新版本".to_owned())?;
     update.timeout = Some(INSTALL_TIMEOUT);
 
@@ -99,10 +99,9 @@ pub async fn install(app: AppHandle) -> Result<(), String> {
 }
 
 async fn start_proxy(app: &AppHandle) -> Result<proxy::ProxyRuntime, String> {
-    let resolved =
-        secrets::resolve_vless_uri()?.ok_or_else(|| "当前构建未内置 VLESS 更新线路".to_owned())?;
+    let uri = secrets::vless_uri()?;
     let proxy_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || proxy::start(&proxy_app, &resolved.uri))
+    tauri::async_runtime::spawn_blocking(move || proxy::start(&proxy_app, uri))
         .await
         .map_err(|_| "启动软件更新代理时发生内部错误".to_owned())?
 }

@@ -1,6 +1,8 @@
 use std::{
+    env,
     fs::File,
     io::{Read, Seek, SeekFrom},
+    path::PathBuf,
     process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
@@ -40,6 +42,7 @@ pub fn update(app: &AppHandle) -> Result<(), String> {
 }
 
 fn run_winget(app: &AppHandle, action: &str, action_message: &str) -> Result<(), String> {
+    ensure_winget_proxy_enabled()?;
     let uri = secrets::vless_uri()?;
     let runtime = proxy::start(app, uri)?;
     emit(
@@ -84,7 +87,7 @@ fn run_winget_command(action: &str, runtime: &proxy::ProxyRuntime) -> Result<Out
         .try_clone()
         .map_err(|_| "无法准备 Microsoft Store 日志".to_owned())?;
 
-    let mut command = Command::new("winget.exe");
+    let mut command = Command::new(winget_path());
     command
         .args([
             action,
@@ -99,10 +102,6 @@ fn run_winget_command(action: &str, runtime: &proxy::ProxyRuntime) -> Result<Out
         ])
         .arg("--proxy")
         .arg(&runtime.url)
-        .env("HTTP_PROXY", &runtime.url)
-        .env("HTTPS_PROXY", &runtime.url)
-        .env("ALL_PROXY", &runtime.url)
-        .env("NO_PROXY", "localhost,127.0.0.1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr));
@@ -151,9 +150,20 @@ fn is_already_current(output: &Output) -> bool {
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    )
-    .to_lowercase();
-    text.contains("no applicable update found") || text.contains("没有适用的更新")
+    );
+    is_already_current_message(&text)
+}
+
+fn is_already_current_message(message: &str) -> bool {
+    let message = message.to_lowercase();
+    [
+        "no applicable update found",
+        "no available upgrade found",
+        "no newer package versions are available",
+        "没有适用的更新",
+    ]
+    .iter()
+    .any(|expected| message.contains(expected))
 }
 
 fn process_error(output: &Output, runtime: &proxy::ProxyRuntime) -> String {
@@ -164,15 +174,83 @@ fn process_error(output: &Output, runtime: &proxy::ProxyRuntime) -> String {
     }
     .trim()
     .to_owned();
-    for secret in [
-        &runtime.url,
-        &runtime.address,
-        &runtime.username,
-        &runtime.password,
-    ] {
-        detail = detail.replace(secret, "[本机网络服务]");
-    }
+    detail = detail.replace(&runtime.url, "[本机网络服务]");
     detail.chars().take(1200).collect()
+}
+
+fn ensure_winget_proxy_enabled() -> Result<(), String> {
+    if read_winget_proxy_setting()? {
+        return Ok(());
+    }
+
+    let winget = winget_path();
+    let script = "$process = Start-Process -FilePath $env:CODEX_GO_WINGET_PATH \
+        -ArgumentList @('settings','--enable','ProxyCommandLineOptions','--disable-interactivity') \
+        -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $process.ExitCode";
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .env("CODEX_GO_WINGET_PATH", &winget)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_window(&mut command);
+
+    let status = command
+        .status()
+        .map_err(|_| "无法请求管理员授权以启用 Windows App Installer 的代理支持".to_owned())?;
+    if !status.success() || !read_winget_proxy_setting()? {
+        return Err(
+            "Codex 安装必须通过内置 VLESS 网络连接。请允许管理员授权，以启用 Windows App Installer 的代理支持"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn read_winget_proxy_setting() -> Result<bool, String> {
+    let mut command = Command::new(winget_path());
+    command
+        .args(["settings", "export", "--disable-interactivity"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    hide_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("无法启动 winget.exe: {error}"))?;
+    if !output.status.success() {
+        return Err("无法读取 Windows App Installer 代理设置".to_owned());
+    }
+    parse_winget_proxy_setting(&output.stdout)
+}
+
+fn parse_winget_proxy_setting(output: &[u8]) -> Result<bool, String> {
+    let settings: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|_| "Windows App Installer 返回了无效的设置数据".to_owned())?;
+    Ok(settings
+        .get("adminSettings")
+        .and_then(|value| value.get("ProxyCommandLineOptions"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false))
+}
+
+fn winget_path() -> PathBuf {
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(local_app_data)
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("winget.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("winget.exe")
 }
 
 fn emit(app: &AppHandle, stage: &str, percent: u8, message: &str) {
@@ -194,3 +272,26 @@ fn hide_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_window(_command: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_enabled_proxy_command_line_setting() {
+        let output = br#"{"adminSettings":{"ProxyCommandLineOptions":true}}"#;
+        assert!(parse_winget_proxy_setting(output).unwrap());
+    }
+
+    #[test]
+    fn treats_missing_proxy_command_line_setting_as_disabled() {
+        let output = br#"{"adminSettings":{}}"#;
+        assert!(!parse_winget_proxy_setting(output).unwrap());
+    }
+
+    #[test]
+    fn recognizes_current_winget_no_upgrade_message() {
+        let output = "No available upgrade found. No newer package versions are available from the configured sources.";
+        assert!(is_already_current_message(output));
+    }
+}

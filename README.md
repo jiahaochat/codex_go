@@ -40,7 +40,7 @@ scripts\build-windows.cmd
 - 扫描 `CODEX_HOME` 中的插件 manifest 和缓存。
 - 扫描个人、系统及插件附带的 `SKILL.md`，限制递归深度且不跟随目录链接。
 - 使用固定版本 Xray，将内置网络通道转为带随机认证的本机 HTTP 代理。
-- Codex Windows 桌面端使用 Microsoft Store 官方渠道安装和更新；需要 Windows App Installer（`winget`）。
+- Codex Windows 桌面端使用 Microsoft Store 官方渠道安装和更新；需要 Windows App Installer（`winget`）。首次通过内置 VLESS 执行 Store 任务时，应用会请求一次管理员授权以启用 WinGet 代理参数，无需用户手动运行设置命令。
 - 代理只监听 `127.0.0.1`，覆盖 `codex_go` 发起的软件更新以及 Codex 安装、升级任务，不修改 Windows 系统代理。
 - 启动后读取公开 Release 的 `latest.json`，比较当前版本，并在用户确认后下载、验签和安装更新。
 - 网络通道固定内置，没有设置或覆盖入口，也不会在 UI 或日志中回显链接。

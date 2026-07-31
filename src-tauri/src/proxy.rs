@@ -37,10 +37,7 @@ pub struct VlessEndpoint {
 pub struct ProxyRuntime {
     child: Child,
     _job: ChildJob,
-    pub address: String,
     pub url: String,
-    pub username: String,
-    pub password: String,
 }
 
 impl Drop for ProxyRuntime {
@@ -184,9 +181,7 @@ pub fn start(app: &AppHandle, uri: &str) -> Result<ProxyRuntime, String> {
         .port();
     drop(listener);
 
-    let user = format!("cg{}", Uuid::new_v4().simple());
-    let password = Uuid::new_v4().simple().to_string();
-    let config = build_xray_config(&endpoint, port, &user, &password);
+    let config = build_xray_config(&endpoint, port);
     let encoded = serde_json::to_vec(&config).map_err(|_| "无法生成 Xray 配置".to_owned())?;
     test_config(&executable, &encoded)?;
 
@@ -228,17 +223,15 @@ pub fn start(app: &AppHandle, uri: &str) -> Result<ProxyRuntime, String> {
         thread::sleep(Duration::from_millis(50));
     }
 
+    let address = format!("http://127.0.0.1:{port}");
     Ok(ProxyRuntime {
         child,
         _job: job,
-        address: format!("http://127.0.0.1:{port}"),
-        url: format!("http://{user}:{password}@127.0.0.1:{port}"),
-        username: user,
-        password,
+        url: address,
     })
 }
 
-fn build_xray_config(endpoint: &VlessEndpoint, port: u16, user: &str, password: &str) -> Value {
+fn build_xray_config(endpoint: &VlessEndpoint, port: u16) -> Value {
     let mut xhttp = Map::new();
     xhttp.insert("path".to_owned(), Value::String(endpoint.path.clone()));
     if let Some(mode) = &endpoint.mode {
@@ -252,9 +245,7 @@ fn build_xray_config(endpoint: &VlessEndpoint, port: u16, user: &str, password: 
             "listen": "127.0.0.1",
             "port": port,
             "protocol": "http",
-            "settings": {
-                "accounts": [{ "user": user, "pass": password }]
-            }
+            "settings": {}
         }],
         "outbounds": [{
             "tag": "codex-go-vless",
@@ -415,12 +406,9 @@ mod tests {
     #[test]
     fn generated_config_keeps_proxy_loopback_and_reality_fields() {
         let endpoint = parse_vless_uri(VALID).unwrap();
-        let config = build_xray_config(&endpoint, 19080, "local-user", "local-pass");
+        let config = build_xray_config(&endpoint, 19080);
         assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
-        assert_eq!(
-            config["inbounds"][0]["settings"]["accounts"][0]["user"],
-            "local-user"
-        );
+        assert!(config["inbounds"][0]["settings"]["accounts"].is_null());
         assert_eq!(config["outbounds"][0]["streamSettings"]["network"], "xhttp");
         assert_eq!(
             config["outbounds"][0]["streamSettings"]["realitySettings"]["password"],

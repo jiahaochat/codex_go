@@ -126,11 +126,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $draftState = gh release view '${{ github.ref_name }}' `
-            --repo jiahaochat/codex_go `
-            --json isDraft `
-            --jq '.isDraft' 2>$null
-          if ($LASTEXITCODE -eq 0 -and [string]$draftState -eq 'false') {
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'codex-go-release-workflow'
+          }
+          # GitHub's by-tag endpoint intentionally hides drafts, so inspect the release list.
+          $releases = Invoke-RestMethod `
+            -Headers $headers `
+            -Uri 'https://api.github.com/repos/${{ github.repository }}/releases?per_page=100'
+          $release = @($releases | Where-Object { $_.tag_name -eq '${{ github.ref_name }}' }) |
+            Select-Object -First 1
+          $alreadyPublished = $null -ne $release -and -not [bool]$release.draft
+          if ($alreadyPublished) {
             'already_published=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             Write-Host 'This tag already has a published release; publication steps are skipped.'
           } else {

@@ -1,6 +1,6 @@
 [package]
 name = "codex-go"
-version = "0.1.0"
+version = "0.1.1"
 description = "Windows manager for Codex installations, plugins, and skills"
 authors = ["codex_go"]
 edition = "2021"

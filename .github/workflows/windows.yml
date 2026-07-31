@@ -194,17 +194,19 @@ jobs:
           }
           $assets = @{}
           foreach ($asset in $release.assets) {
-            $assets[[string]$asset.id] = [string]$asset.browser_download_url
+            $assets[[string]$asset.id] = [string]$asset.name
           }
 
           $latest = Get-Content -Raw -LiteralPath $latestPath | ConvertFrom-Json
+          $tag = [Uri]::EscapeDataString('${{ github.ref_name }}')
           foreach ($platform in $latest.platforms.PSObject.Properties) {
             $match = [regex]::Match([string]$platform.Value.url, '/releases/assets/(?<id>\d+)$')
             if (-not $match.Success -or -not $assets.ContainsKey($match.Groups['id'].Value)) {
               throw "Unable to resolve the public download URL for $($platform.Name)"
             }
-            $platform.Value.url = $assets[$match.Groups['id'].Value]
-            if (-not $platform.Value.url.StartsWith('https://github.com/jiahaochat/codex_go/releases/download/')) {
+            $assetName = $assets[$match.Groups['id'].Value]
+            $platform.Value.url = "https://github.com/${{ github.repository }}/releases/download/$tag/$([Uri]::EscapeDataString($assetName))"
+            if (-not $platform.Value.url.StartsWith("https://github.com/${{ github.repository }}/releases/download/$tag/")) {
               throw "Unexpected updater URL for $($platform.Name)"
             }
           }

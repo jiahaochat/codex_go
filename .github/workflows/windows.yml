@@ -9,13 +9,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test-and-build:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -24,7 +26,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          toolchain: stable
+          toolchain: 1.97.1
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -61,8 +63,8 @@ jobs:
           CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
         run: |
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Verify release secrets are configured
         if: github.event_name != 'pull_request'
@@ -71,13 +73,11 @@ jobs:
           CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          RELEASE_REPO_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
         run: |
           $required = @(
             'CODEX_GO_DEFAULT_VLESS_URI',
             'TAURI_SIGNING_PRIVATE_KEY',
-            'TAURI_SIGNING_PRIVATE_KEY_PASSWORD',
-            'RELEASE_REPO_TOKEN'
+            'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'
           )
           foreach ($name in $required) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
@@ -91,7 +91,7 @@ jobs:
           CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build
+        run: npm run tauri build -- -- --locked
 
       - name: Upload Windows installer
         if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
@@ -109,6 +109,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: powershell
         run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag must point to a commit contained in main"
+          }
           $tauriVersion = node -p "require('./src-tauri/tauri.conf.json').version"
           if ("v$tauriVersion" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match app version v$tauriVersion"
@@ -118,27 +123,25 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           CODEX_GO_DEFAULT_VLESS_URI: ${{ secrets.CODEX_GO_DEFAULT_VLESS_URI }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          owner: jiahaochat
-          repo: codex_go-releases
-          releaseCommitish: main
           tagName: v__VERSION__
           releaseName: codex_go v__VERSION__
           releaseBody: Windows 稳定版安装包。应用内更新会验证 Tauri 签名。
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
+          args: -- --locked
           updaterJsonPreferNsis: true
           uploadUpdaterJson: true
 
-      - name: Use public download URLs in updater metadata
+      - name: Verify updater metadata and publish release
         if: startsWith(github.ref, 'refs/tags/')
         shell: powershell
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           $latestPath = Join-Path $env:GITHUB_WORKSPACE 'latest.json'
           if (-not (Test-Path -LiteralPath $latestPath)) {
@@ -154,7 +157,7 @@ jobs:
           $tag = [Uri]::EscapeDataString('${{ github.ref_name }}')
           $release = Invoke-RestMethod `
             -Headers $headers `
-            -Uri "https://api.github.com/repos/jiahaochat/codex_go-releases/releases/tags/$tag"
+            -Uri "https://api.github.com/repos/jiahaochat/codex_go/releases/tags/$tag"
           $assets = @{}
           foreach ($asset in $release.assets) {
             $assets[[string]$asset.id] = [string]$asset.browser_download_url
@@ -167,7 +170,7 @@ jobs:
               throw "Unable to resolve the public download URL for $($platform.Name)"
             }
             $platform.Value.url = $assets[$match.Groups['id'].Value]
-            if (-not $platform.Value.url.StartsWith('https://github.com/jiahaochat/codex_go-releases/releases/download/')) {
+            if (-not $platform.Value.url.StartsWith('https://github.com/jiahaochat/codex_go/releases/download/')) {
               throw "Unexpected updater URL for $($platform.Name)"
             }
           }
@@ -175,8 +178,14 @@ jobs:
           $encoding = New-Object Text.UTF8Encoding($false)
           [IO.File]::WriteAllText($latestPath, ($latest | ConvertTo-Json -Depth 10), $encoding)
           gh release upload '${{ github.ref_name }}' $latestPath `
-            --repo jiahaochat/codex_go-releases `
+            --repo jiahaochat/codex_go `
             --clobber
           if ($LASTEXITCODE -ne 0) {
             throw 'Unable to replace latest.json with public download URLs'
+          }
+          gh release edit '${{ github.ref_name }}' `
+            --repo jiahaochat/codex_go `
+            --draft=false
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Updater metadata is valid, but the release could not be published'
           }

@@ -24,7 +24,7 @@ if errorlevel 1 (
   popd
   exit /b 1
 )
-call npm run tauri build -- --config src-tauri/tauri.local.conf.json
+call npm run tauri build -- --config src-tauri/tauri.local.conf.json -- --locked
 set EXIT_CODE=%ERRORLEVEL%
 
 if %EXIT_CODE%==0 (

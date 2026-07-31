@@ -1304,7 +1304,12 @@ fn path_key(path: &Path) -> String {
 }
 
 fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    let path = path.to_string_lossy();
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.into_owned()
+    }
 }
 
 fn nonempty(value: &str) -> Option<String> {

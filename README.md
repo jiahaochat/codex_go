@@ -60,14 +60,13 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## 远程更新与发布
 
-源码仓库 `jiahaochat/codex_go` 保持私有；更新产物发布到公开仓库 `jiahaochat/codex_go-releases`。公开仓库只存安装包、Tauri 签名和 `latest.json`，不公开源码。普通用户无需 Git 或 GitHub Token。
+项目只使用一个公开的 GitHub 仓库 `jiahaochat/codex_go`，源码、安装包、Tauri 签名和 `latest.json` 都在同一个仓库。这样普通用户无需 Git 或 GitHub Token 即可访问 Release 更新。
 
-私有源码仓库需要以下 Actions Secrets：
+该仓库需要以下 Actions Secrets：
 
 - `CODEX_GO_DEFAULT_VLESS_URI`：内置下载线路。
 - `TAURI_SIGNING_PRIVATE_KEY`：Tauri updater 私钥。
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码。
-- `RELEASE_REPO_TOKEN`：仅用于 Actions 向公开发布仓库创建 Release。
 
 Updater 私钥一旦丢失，就无法再给已安装客户端发布可验证的更新。首次配置 Actions Secret 时，应把加密私钥及其密码另存到受控的离线备份；备份不能提交到 Git。
 
@@ -76,9 +75,10 @@ Updater 私钥一旦丢失，就无法再给已安装客户端发布可验证的
 1. 同步修改 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 的版本号。
 2. 提交并推送 `main`，等待 Windows 构建通过。
 3. 创建并推送同版本标签，例如 `git tag -a v0.2.0 -m "codex_go v0.2.0"` 和 `git push origin v0.2.0`。
-4. GitHub Actions 构建签名 NSIS 包并在公开仓库生成 `latest.json`。客户端通过内置线路访问该文件，按语义版本提示更新。
+4. GitHub Actions 只接受 `main` 历史上的标签，按 `Cargo.lock` 构建签名 NSIS 包，并在同一仓库的草稿 Release 中生成和验证 `latest.json`。
+5. 元数据验证通过后工作流才公开 Release。客户端通过内置线路访问该文件，按语义版本提示更新。
 
-发布工作流会把 updater 元数据中的 GitHub API asset 地址改写为公开 Release 直链，避免所有用户共用 VLESS 出口时共享匿名 API 频率限制。
+发布工作流会把 updater 元数据中的 GitHub API asset 地址改写为同一仓库的公开 Release 直链，避免所有用户共用 VLESS 出口时共享匿名 API 频率限制。
 
 更新器使用独立的 Tauri/minisign 签名验证包内容。代码签名（Authenticode）是另一层机制，正式广泛分发前仍建议购买证书以减少 Windows SmartScreen 提示。
 

@@ -1,15 +1,20 @@
+mod drive;
 mod installer;
 mod inventory;
 mod launcher;
 mod process_guard;
 mod proxy;
 mod secrets;
+mod sub2api;
 mod updater;
 
 use std::{
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use chrono::Utc;
@@ -23,6 +28,91 @@ struct OperationState {
 
 struct OperationPermit<'a> {
     state: &'a OperationState,
+}
+
+#[tauri::command]
+async fn get_drive_session(
+    state: State<'_, Arc<drive::DriveState>>,
+) -> Result<drive::DriveSession, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.session())
+        .await
+        .map_err(|_| "读取 Drive 登录状态时发生内部错误".to_owned())?
+}
+
+#[tauri::command]
+async fn login_drive(
+    state: State<'_, Arc<drive::DriveState>>,
+    username: String,
+    password: String,
+) -> Result<drive::DriveSession, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.login(&username, &password))
+        .await
+        .map_err(|_| "保存 Drive 登录信息时发生内部错误".to_owned())?
+}
+
+#[tauri::command]
+async fn logout_drive(state: State<'_, Arc<drive::DriveState>>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.logout())
+        .await
+        .map_err(|_| "退出 Drive 登录时发生内部错误".to_owned())?
+}
+
+#[tauri::command]
+async fn list_drive_directory(
+    state: State<'_, Arc<drive::DriveState>>,
+    path: Option<String>,
+) -> Result<drive::DriveDirectory, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.list_directory(path.as_deref()))
+        .await
+        .map_err(|_| "读取 Drive 文件夹时发生内部错误".to_owned())?
+}
+
+#[tauri::command]
+async fn open_drive_file(
+    state: State<'_, Arc<drive::DriveState>>,
+    path: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = state.validate_file_path(&path)?;
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("explorer.exe");
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+            command.arg(&path);
+            command
+        };
+
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let mut command = Command::new("open");
+            command.arg(&path);
+            command
+        };
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = {
+            let mut command = Command::new("xdg-open");
+            command.arg(&path);
+            command
+        };
+
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| "无法打开 Drive 文件".to_owned())
+    })
+    .await
+    .map_err(|_| "打开 Drive 文件时发生内部错误".to_owned())?
 }
 
 impl OperationState {
@@ -74,14 +164,14 @@ async fn delete_plugin(plugin_id: String) -> Result<(), String> {
 async fn delete_skill(skill_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || inventory::delete_skill(&skill_id))
         .await
-        .map_err(|_| "删除 Skill 时发生内部错误".to_owned())?
+        .map_err(|_| "删除技能时发生内部错误".to_owned())?
 }
 
 #[tauri::command]
 async fn read_skill_content(skill_id: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || inventory::read_skill_content(&skill_id))
         .await
-        .map_err(|_| "读取 Skill 内容时发生内部错误".to_owned())?
+        .map_err(|_| "读取技能内容时发生内部错误".to_owned())?
 }
 
 async fn collect_snapshot(app: AppHandle) -> Result<AppSnapshot, String> {
@@ -159,10 +249,16 @@ async fn update_codex(app: AppHandle, state: State<'_, OperationState>) -> Resul
 async fn launch_codex(
     app: AppHandle,
     state: State<'_, OperationState>,
+    drive: State<'_, Arc<drive::DriveState>>,
     codex: CodexStatus,
 ) -> Result<launcher::CodexRuntimeStatus, String> {
     let _permit = state.acquire()?;
-    launcher::launch(&app, &codex).await
+    let drive = drive.inner().clone();
+    let assignment = tauri::async_runtime::spawn_blocking(move || drive.prepare_codex_home())
+        .await
+        .map_err(|_| "准备 Drive 用户的 Codex 配置时发生内部错误".to_owned())?
+        .map_err(|error| format!("无法准备当前 Drive 用户的 Codex 配置：{error}"))?;
+    launcher::launch(&app, &codex, assignment).await
 }
 
 #[tauri::command]
@@ -191,7 +287,13 @@ async fn install_app_update(
 }
 
 #[tauri::command]
-fn reveal_path(path: String) -> Result<(), String> {
+async fn reveal_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || reveal_path_blocking(path))
+        .await
+        .map_err(|_| "打开目标位置时发生内部错误".to_owned())?
+}
+
+fn reveal_path_blocking(path: String) -> Result<(), String> {
     let path = PathBuf::from(path);
     if !path.exists() {
         return Err("目标位置已不存在".to_owned());
@@ -251,7 +353,13 @@ pub fn run() {
         .manage(OperationState {
             running: AtomicBool::new(false),
         })
+        .manage(Arc::new(drive::DriveState::default()))
         .invoke_handler(tauri::generate_handler![
+            get_drive_session,
+            login_drive,
+            logout_drive,
+            list_drive_directory,
+            open_drive_file,
             get_snapshot,
             refresh_snapshot,
             delete_plugin,

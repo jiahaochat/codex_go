@@ -95,7 +95,7 @@ GitHub Actions 和本地打包脚本会下载并校验：
 
 ## 数据读取范围
 
-应用读取 `CODEX_HOME`（默认 `%USERPROFILE%\.codex`）中的插件、Skills 和 manifest。它不会读取或展示 `auth.json`、会话正文或 API Key。
+Drive 登录后，应用管理 `\\drive\cloud\<当前用户>\.codex` 中的插件、Skills 和 manifest。从 Codex Go 启动官方 Codex 时，同一路径仅通过该 Codex 子进程的 `CODEX_HOME` 环境变量传入；目录不存在时由 Codex 自行创建。通过其他入口启动 Codex 不受影响，仍使用其默认路径。应用不会读取或展示 `auth.json`、会话正文或 API Key。
 
 ## 许可
 

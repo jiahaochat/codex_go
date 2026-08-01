@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   Box,
   Check,
@@ -10,9 +11,13 @@ import {
   Download,
   FolderOpen,
   FileText,
+  Folder,
   Gauge,
+  KeyRound,
   Layers3,
   LoaderCircle,
+  LogIn,
+  LogOut,
   Minus,
   PackageCheck,
   Play,
@@ -25,6 +30,7 @@ import {
   Sparkles,
   TerminalSquare,
   Trash2,
+  UserRound,
   X,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -34,10 +40,15 @@ import {
   checkCodexUpdate,
   deletePlugin,
   deleteSkill,
+  getDriveSession,
   getSnapshot,
   installAppUpdate,
   installCodex,
   launchCodex,
+  listDriveDirectory,
+  loginDrive,
+  logoutDrive,
+  openDriveFile,
   updateCodex,
   onAppUpdateProgress,
   onCodexLaunchProgress,
@@ -47,6 +58,8 @@ import {
   revealPath,
   type AppSnapshot,
   type CodexLaunchProgress,
+  type DriveSession,
+  type DriveDirectory,
   type InstallProgress,
   type PluginItem,
   type SkillItem,
@@ -61,7 +74,7 @@ import {
   type SkillFilter,
 } from "./inventory-filter";
 
-type View = "overview" | "plugins" | "skills" | "settings";
+type View = "overview" | "drive" | "plugins" | "skills" | "settings";
 type StatusTone = "success" | "warning" | "neutral";
 
 const sourceLabels = {
@@ -101,6 +114,7 @@ function runButtonLabel(state: AppSnapshot["codexRuntime"]["state"]): string {
 
 function App() {
   const [view, setView] = useState<View>("overview");
+  const [driveSession, setDriveSession] = useState<DriveSession | null>(null);
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -121,15 +135,29 @@ function App() {
   const [updating, setUpdating] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   const load = useCallback(async (refresh = false) => {
     refresh ? setRefreshing(true) : setLoading(true);
     setError(null);
+    setAuthError(null);
+    let driveAuthenticated = false;
     try {
+      const drive = await getDriveSession();
+      setDriveSession(drive);
+      if (!drive.authenticated) {
+        setSnapshot(null);
+        return;
+      }
+      driveAuthenticated = true;
       const next = refresh ? await refreshSnapshot() : await getSnapshot();
       setSnapshot(next);
     } catch (reason) {
-      setError(errorMessage(reason));
+      if (!driveAuthenticated) {
+        setDriveSession({ authenticated: false, username: null, folderPath: null });
+        setSnapshot(null);
+        setAuthError(errorMessage(reason));
+      } else setError(errorMessage(reason));
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -146,6 +174,7 @@ function App() {
   }, [snapshot?.codex.version]);
 
   const checkUpdates = useCallback(async (manual = false) => {
+    if (!driveSession?.authenticated) return;
     setCheckingUpdate(true);
     setUpdateChecked(false);
     if (manual) setUpdateError(null);
@@ -159,7 +188,7 @@ function App() {
     } finally {
       setCheckingUpdate(false);
     }
-  }, []);
+  }, [driveSession?.authenticated]);
 
   useEffect(() => {
     void checkUpdates();
@@ -283,10 +312,39 @@ function App() {
     }
   };
 
+  const signOutDrive = async () => {
+    setAuthError(null);
+    try {
+      await logoutDrive();
+      setDriveSession({ authenticated: false, username: null, folderPath: null });
+      setSnapshot(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  };
+
+  if (!driveSession?.authenticated) {
+    return (
+      <div className="app-frame">
+        <WindowTitlebar />
+        <DriveLogin
+          checking={loading && driveSession === null}
+          initialError={authError}
+          onAuthenticated={(session) => {
+            setDriveSession(session);
+            setAuthError(null);
+            void load();
+          }}
+        />
+      </div>
+    );
+  }
+
   const title = {
     overview: "总览",
+    drive: "我的 Drive",
     plugins: "插件",
-    skills: "Skills",
+    skills: "技能",
     settings: "应用设置",
   }[view];
 
@@ -294,7 +352,14 @@ function App() {
     <div className="app-frame">
       <WindowTitlebar />
       <div className="app-shell">
-        <Sidebar view={view} onChange={setView} snapshot={snapshot} />
+        <Sidebar
+          view={view}
+          onChange={setView}
+          snapshot={snapshot}
+          driveSession={driveSession}
+          onOpenDrive={() => setView("drive")}
+          onSignOut={() => void signOutDrive()}
+        />
         <main className="main-panel">
           <header className="topbar">
             <div>
@@ -348,6 +413,7 @@ function App() {
                 onNavigate={setView}
               />
             ) : null}
+            {view === "drive" ? <DriveBrowser session={driveSession} /> : null}
             {snapshot && view === "plugins" ? <PluginInventory items={snapshot.plugins} onChanged={() => load(true)} /> : null}
             {snapshot && view === "skills" ? <SkillInventory items={snapshot.skills} onChanged={() => load(true)} /> : null}
             {snapshot && view === "settings" ? (
@@ -376,6 +442,182 @@ function App() {
         </main>
       </div>
     </div>
+  );
+}
+
+function DriveBrowser({ session }: { session: DriveSession }) {
+  const [directory, setDirectory] = useState<DriveDirectory | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadDirectory = useCallback(async (path?: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      setDirectory(await listDriveDirectory(path));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadDirectory();
+  }, [loadDirectory, session.username]);
+
+  const openEntry = async (entry: DriveDirectory["entries"][number]) => {
+    if (entry.isDirectory) {
+      await loadDirectory(entry.path);
+      return;
+    }
+    try {
+      await openDriveFile(entry.path);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  };
+
+  const crumbs = directory
+    ? directory.currentPath
+        .slice(directory.rootPath.length)
+        .split("\\")
+        .filter(Boolean)
+    : [];
+
+  return (
+    <section className="drive-browser" aria-label="Drive 文件浏览器">
+      <div className="drive-browser-toolbar">
+        <button
+          className="icon-button"
+          type="button"
+          title="返回上一级"
+          aria-label="返回上一级"
+          disabled={!directory?.parentPath || loading}
+          onClick={() => directory?.parentPath && void loadDirectory(directory.parentPath)}
+        >
+          <ChevronRight className="back-chevron" size={18} />
+        </button>
+        <div className="drive-breadcrumb">
+          <FolderOpen size={16} />
+          <strong>{session.username}</strong>
+          {crumbs.map((crumb, index) => <Fragment key={`${crumb}-${index}`}><ChevronRight size={13} /><span>{crumb}</span></Fragment>)}
+        </div>
+        <button className="icon-button" type="button" title="刷新文件夹" aria-label="刷新文件夹" disabled={loading} onClick={() => void loadDirectory(directory?.currentPath)}>
+          <RefreshCw className={loading ? "spin" : undefined} size={17} />
+        </button>
+      </div>
+
+      {error ? <ErrorBanner message={error} onRetry={() => void loadDirectory(directory?.currentPath)} /> : null}
+      {loading && !directory ? <LoadingState /> : null}
+      {directory ? (
+        <div className="file-table">
+          <div className="file-table-header"><span>名称</span><span>修改时间</span><span>大小</span></div>
+          {directory.entries.map((entry) => (
+            <button className="file-row" type="button" key={entry.path} onClick={() => void openEntry(entry)}>
+              <span className={entry.isDirectory ? "file-type-icon folder" : "file-type-icon"}>{entry.isDirectory ? <Folder size={18} /> : <FileText size={18} />}</span>
+              <strong>{entry.name}</strong>
+              <span>{entry.modifiedAt ? formatFileDate(entry.modifiedAt) : "-"}</span>
+              <span>{entry.isDirectory ? "-" : formatFileSize(entry.size)}</span>
+            </button>
+          ))}
+          {!directory.entries.length ? <div className="empty-state compact"><FolderOpen size={25} /><span>此文件夹为空</span></div> : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function DriveLogin({
+  checking,
+  initialError,
+  onAuthenticated,
+}: {
+  checking: boolean;
+  initialError: string | null;
+  onAuthenticated: (session: DriveSession) => void;
+}) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [attempted, setAttempted] = useState(false);
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!username.trim() || !password) {
+      setError("请输入 Drive 用户名和密码");
+      return;
+    }
+
+    setSubmitting(true);
+    setError(null);
+    setAttempted(true);
+    try {
+      const session = await loginDrive(username, password);
+      setPassword("");
+      onAuthenticated(session);
+    } catch (reason) {
+      setPassword("");
+      setError(errorMessage(reason));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const displayedError = error ?? (attempted ? null : initialError);
+
+  if (checking) {
+    return (
+      <main className="drive-auth-shell">
+        <div className="drive-auth-checking">
+          <LoaderCircle className="spin" size={24} />
+          <span>正在识别 Drive 登录信息</span>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <main className="drive-auth-shell">
+      <form className="drive-login" onSubmit={(event) => void submit(event)}>
+        <div className="drive-login-icon"><KeyRound size={25} /></div>
+        <div className="drive-login-heading">
+          <p className="eyebrow">Windows Drive</p>
+          <h1>登录 Drive</h1>
+          <p>使用你的 Drive 账号继续</p>
+        </div>
+        <label className="login-field">
+          <span>用户名</span>
+          <input
+            autoFocus
+            autoComplete="username"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            placeholder="例如 jiahao"
+            disabled={submitting}
+          />
+        </label>
+        <label className="login-field">
+          <span>密码</span>
+          <input
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            disabled={submitting}
+          />
+        </label>
+        {displayedError ? (
+          <div className="login-error" role="alert"><CircleAlert size={15} />{displayedError}</div>
+        ) : null}
+        <button className="primary-command drive-login-submit" type="submit" disabled={submitting}>
+          {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
+          {submitting ? "正在登录" : "登录"}
+        </button>
+        <p className="drive-credential-note"><ShieldCheck size={14} />登录信息将保存到 Windows 凭据管理器</p>
+      </form>
+    </main>
   );
 }
 
@@ -415,7 +657,7 @@ function WindowTitlebar() {
     <header className="window-titlebar" data-tauri-drag-region>
       <div className="titlebar-brand" data-tauri-drag-region>
         <img src={codexGoIcon} alt="" aria-hidden="true" />
-        <strong data-tauri-drag-region>codex_go</strong>
+        <strong data-tauri-drag-region>Codex Go</strong>
       </div>
       <div
         className="titlebar-drag-area"
@@ -446,15 +688,21 @@ function Sidebar({
   view,
   onChange,
   snapshot,
+  driveSession,
+  onOpenDrive,
+  onSignOut,
 }: {
   view: View;
   onChange: (view: View) => void;
   snapshot: AppSnapshot | null;
+  driveSession: DriveSession;
+  onOpenDrive: () => void;
+  onSignOut: () => void;
 }) {
   const navigation: Array<{ id: View; label: string; icon: typeof Gauge; count?: number }> = [
     { id: "overview", label: "总览", icon: Gauge },
     { id: "plugins", label: "插件", icon: Plug, count: snapshot?.plugins.length },
-    { id: "skills", label: "Skills", icon: Sparkles, count: snapshot?.skills.length },
+    { id: "skills", label: "技能", icon: Sparkles, count: snapshot?.skills.length },
     { id: "settings", label: "应用设置", icon: Settings2 },
   ];
 
@@ -474,12 +722,21 @@ function Sidebar({
           </button>
         ))}
       </nav>
+      <button className={view === "drive" ? "drive-folder active" : "drive-folder"} type="button" onClick={onOpenDrive} title={driveSession.folderPath ?? undefined}>
+        <FolderOpen size={18} />
+        <span>
+          <strong>{driveSession.username}</strong>
+          <small>我的 Drive 文件夹</small>
+        </span>
+        <ChevronRight size={15} />
+      </button>
       <div className="sidebar-footer">
-        <span className={snapshot?.codexRuntime.state === "managed" ? "status-dot online" : "status-dot"} />
+        <span className="user-avatar"><UserRound size={15} /></span>
         <div>
-          <strong>{snapshot ? runtimeLabels[snapshot.codexRuntime.state] : "正在检测"}</strong>
-          <span>{snapshot?.codexRuntime.state === "managed" ? `Codex Go ${snapshot.appVersion}` : snapshot?.codex.version ?? "尚未检测到版本"}</span>
+          <strong>{driveSession.username}</strong>
+          <span>Drive 已登录</span>
         </div>
+        <button type="button" title="切换 Drive 账号" aria-label="切换 Drive 账号" onClick={onSignOut}><LogOut size={15} /></button>
       </div>
     </aside>
   );
@@ -557,9 +814,9 @@ function Overview({
         />
         <Metric
           icon={Sparkles}
-          label="可用 Skills"
+          label="可用技能"
           value={snapshot.skills.length}
-          detail={`${snapshot.skills.filter((item) => item.origin === "personal").length} 个个人 Skill`}
+          detail={`${snapshot.skills.filter((item) => item.origin === "personal").length} 个个人技能`}
           accent="amber"
           onClick={() => onNavigate("skills")}
         />
@@ -757,7 +1014,7 @@ function SkillInventory({ items, onChanged }: { items: SkillItem[]; onChanged: (
   const grouped = useMemo(() => groupSkillsByPlugin(visible), [visible]);
 
   const remove = async (skill: SkillItem) => {
-    if (!window.confirm(`确定删除 Skill“${skill.name}”吗？此操作无法撤销。`)) return;
+    if (!window.confirm(`确定删除技能“${skill.name}”吗？此操作无法撤销。`)) return;
     setDeletingId(skill.id);
     setDeleteError(null);
     try {
@@ -838,8 +1095,8 @@ function SkillInventory({ items, onChanged }: { items: SkillItem[]; onChanged: (
   return (
     <>
       <InventoryView
-      label="Skill 库存"
-      title={`${items.length} 个可用 Skills`}
+      label="技能库"
+      title={`${items.length} 个可用技能`}
       query={query}
       onQuery={setQuery}
       filter={filter}
@@ -874,7 +1131,7 @@ function SkillInventory({ items, onChanged }: { items: SkillItem[]; onChanged: (
               </span>
               <span className="skill-group-copy">
                 <strong>{group.pluginName}</strong>
-                <span>{group.items.length} 个插件附带 Skill</span>
+                <span>{group.items.length} 个插件附带技能</span>
               </span>
               {official ? <span className="official-badge"><ShieldCheck size={12} />官方</span> : null}
               <span className="skill-group-count">{group.items.length}</span>
@@ -883,7 +1140,7 @@ function SkillInventory({ items, onChanged }: { items: SkillItem[]; onChanged: (
           </div>
         );
       })}
-      {!visible.length ? <EmptyState title={items.length ? "没有符合条件的 Skill" : "尚未识别到 Skill"} /> : null}
+      {!visible.length ? <EmptyState title={items.length ? "没有符合条件的技能" : "尚未识别到技能"} /> : null}
       </InventoryView>
       {selectedSkill ? (
         <SkillDetailDialog
@@ -1150,7 +1407,7 @@ function InventoryRow({
       <span className="inventory-meta">{meta}</span>
       {showStatus && status ? <StatusPill tone={tone}>{status}</StatusPill> : null}
       <div className="row-actions">
-        {onOpen ? <button className="row-action" type="button" title="查看 Skill 内容" aria-label={`查看 ${name} 内容`} disabled={deleting} onClick={onOpen}><FileText size={17} /></button> : null}
+        {onOpen ? <button className="row-action" type="button" title="查看技能内容" aria-label={`查看 ${name} 内容`} disabled={deleting} onClick={onOpen}><FileText size={17} /></button> : null}
         <button className="row-action" type="button" title="打开所在位置" aria-label={`打开 ${name} 所在位置`} disabled={!path || deleting} onClick={() => path && void revealPath(path)}><FolderOpen size={17} /></button>
         {onDelete ? (
           <button className="row-action delete-action" type="button" title="删除" aria-label={`删除 ${name}`} disabled={deleting} onClick={onDelete}>
@@ -1187,7 +1444,7 @@ function SkillDetailDialog({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <section className="dialog skill-dialog" role="dialog" aria-modal="true" aria-labelledby="skill-dialog-title">
         <div className="dialog-header">
@@ -1199,7 +1456,7 @@ function SkillDetailDialog({
           </div>
           <button className="icon-button" type="button" title="关闭" aria-label="关闭" onClick={onClose}><X size={17} /></button>
         </div>
-        {loading ? <div className="skill-dialog-state"><LoaderCircle size={22} className="spin" /><span>正在读取 Skill 内容</span></div> : null}
+        {loading ? <div className="skill-dialog-state"><LoaderCircle size={22} className="spin" /><span>正在读取技能内容</span></div> : null}
         {error ? <div className="skill-dialog-error"><CircleAlert size={16} /><span>{error}</span></div> : null}
         {!loading && !error ? <MarkdownPreview content={content} /> : null}
         <div className="dialog-actions">
@@ -1209,7 +1466,8 @@ function SkillDetailDialog({
           </button>
         </div>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -1307,6 +1565,25 @@ function errorMessage(reason: unknown): string {
 function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "刚刚" : date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatFileDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatFileSize(value: number | null): string {
+  if (value === null) return "-";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${(value / 1024 ** 3).toFixed(1)} GB`;
 }
 
 export default App;

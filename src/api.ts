@@ -63,6 +63,27 @@ export interface AppSnapshot {
   checkedAt: string;
 }
 
+export interface DriveSession {
+  authenticated: boolean;
+  username: string | null;
+  folderPath: string | null;
+}
+
+export interface DriveEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size: number | null;
+  modifiedAt: string | null;
+}
+
+export interface DriveDirectory {
+  rootPath: string;
+  currentPath: string;
+  parentPath: string | null;
+  entries: DriveEntry[];
+}
+
 export interface InstallProgress {
   stage: "preparing" | "proxy" | "downloading" | "installing" | "verifying" | "complete" | "error";
   percent: number;
@@ -179,6 +200,12 @@ const previewSnapshot: AppSnapshot = {
   checkedAt: new Date().toISOString(),
 };
 
+const previewDriveSession: DriveSession = {
+  authenticated: true,
+  username: "jiahao",
+  folderPath: "\\\\drive\\cloud\\jiahao",
+};
+
 function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
@@ -186,6 +213,45 @@ function isTauri(): boolean {
 export async function getSnapshot(): Promise<AppSnapshot> {
   if (!isTauri()) return previewSnapshot;
   return invoke<AppSnapshot>("get_snapshot");
+}
+
+export async function getDriveSession(): Promise<DriveSession> {
+  if (!isTauri()) return previewDriveSession;
+  return invoke<DriveSession>("get_drive_session");
+}
+
+export async function loginDrive(username: string, password: string): Promise<DriveSession> {
+  if (!isTauri()) {
+    const account = username.trim().split(/[\\/@]/).filter(Boolean).at(-1) ?? username.trim();
+    return { authenticated: true, username: account, folderPath: `\\\\drive\\cloud\\${account}` };
+  }
+  return invoke<DriveSession>("login_drive", { username, password });
+}
+
+export async function logoutDrive(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("logout_drive");
+}
+
+export async function listDriveDirectory(path?: string): Promise<DriveDirectory> {
+  if (!isTauri()) {
+    const rootPath = previewDriveSession.folderPath ?? "\\\\drive\\cloud\\jiahao";
+    return {
+      rootPath,
+      currentPath: path ?? rootPath,
+      parentPath: path && path !== rootPath ? rootPath : null,
+      entries: [
+        { name: "文档", path: `${rootPath}\\文档`, isDirectory: true, size: null, modifiedAt: new Date().toISOString() },
+        { name: "项目资料.pdf", path: `${rootPath}\\项目资料.pdf`, isDirectory: false, size: 248320, modifiedAt: new Date().toISOString() },
+      ],
+    };
+  }
+  return invoke<DriveDirectory>("list_drive_directory", { path: path ?? null });
+}
+
+export async function openDriveFile(path: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("open_drive_file", { path });
 }
 
 export async function refreshSnapshot(): Promise<AppSnapshot> {
@@ -233,7 +299,7 @@ export async function deleteSkill(skillId: string): Promise<void> {
 
 export async function readSkillContent(skillId: string): Promise<string> {
   if (!isTauri()) {
-    return "# Skill 内容\n\n当前为浏览器预览模式。请在 Codex Go 桌面端查看完整的 SKILL.md。";
+    return "# 技能内容\n\n当前为浏览器预览模式。请在 Codex Go 桌面端查看完整的 SKILL.md。";
   }
   return invoke<string>("read_skill_content", { skillId });
 }

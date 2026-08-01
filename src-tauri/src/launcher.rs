@@ -1,4 +1,4 @@
-use crate::inventory::CodexStatus;
+use crate::{inventory::CodexStatus, sub2api::ApiKeyAssignment};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6,23 +6,32 @@ use std::{
     collections::HashSet,
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock, RwLock,
+    },
     time::Duration,
 };
 use tauri::{AppHandle, Emitter};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-#[cfg(all(test, windows))]
-use std::os::windows::process::CommandExt;
-
 const DEBUG_PORT: u16 = 9230;
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CDP_TIMEOUT: Duration = Duration::from_secs(3);
 const LAUNCH_ATTEMPTS: usize = 32;
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(4);
+const USAGE_REFRESH_TICKS: u8 = 15;
 
 static WATCHDOG_RUNNING: AtomicBool = AtomicBool::new(false);
+static INJECTION_CONTEXT: OnceLock<RwLock<Option<InjectionContext>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct InjectionContext {
+    app_version: String,
+    assignment: ApiKeyAssignment,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -105,7 +114,11 @@ pub fn runtime_status(codex: &CodexStatus) -> CodexRuntimeStatus {
     )
 }
 
-pub async fn launch(app: &AppHandle, codex: &CodexStatus) -> Result<CodexRuntimeStatus, String> {
+pub async fn launch(
+    app: &AppHandle,
+    codex: &CodexStatus,
+    assignment: ApiKeyAssignment,
+) -> Result<CodexRuntimeStatus, String> {
     emit_progress(app, "starting", "正在启动 Codex Windows 桌面端");
     if !codex.installed {
         return Err("尚未安装 Codex Windows 桌面端".to_owned());
@@ -124,10 +137,14 @@ pub async fn launch(app: &AppHandle, codex: &CodexStatus) -> Result<CodexRuntime
         processes.visible_window,
         managed,
     );
+    let same_managed_user = current.managed
+        && injection_context()
+            .is_some_and(|context| context.assignment.username == assignment.username);
+    set_injection_context(app_version, assignment);
 
-    if current.managed {
+    if same_managed_user {
         emit_progress(app, "complete", "Codex 已运行");
-        start_injection_task(app.clone(), app_version);
+        start_injection_task(app.clone());
         return Ok(current);
     }
 
@@ -151,16 +168,9 @@ pub async fn launch(app: &AppHandle, codex: &CodexStatus) -> Result<CodexRuntime
         ));
     }
 
-    let arguments = format!(
-        "--remote-debugging-port={DEBUG_PORT} --remote-allow-origins=http://127.0.0.1:{DEBUG_PORT}"
-    );
-    let activation_id = codex
-        .path
-        .as_deref()
-        .and_then(packaged_app_user_model_id)
-        .ok_or_else(|| "无法解析 Codex Windows 应用标识".to_owned())?;
+    let codex_home = crate::inventory::resolve_codex_home();
     #[cfg(windows)]
-    let process_id = activate_packaged_app(&activation_id, &arguments).await?;
+    let process_id = launch_codex_process(&executable, &codex_home).await?;
     #[cfg(not(windows))]
     return Err("Codex Windows 打包应用激活仅支持 Windows".to_owned());
 
@@ -170,13 +180,47 @@ pub async fn launch(app: &AppHandle, codex: &CodexStatus) -> Result<CodexRuntime
         "complete",
         &format!("Codex 已通过 Codex Go 启动（PID {process_id}）"),
     );
-    start_injection_task(app.clone(), app_version);
+    start_injection_task(app.clone());
     Ok(CodexRuntimeStatus {
         state: CodexRuntimeState::Managed,
         running: true,
         managed: true,
         restart_required: false,
     })
+}
+
+fn build_codex_command(executable: &Path, codex_home: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg(format!("--remote-debugging-port={DEBUG_PORT}"))
+        .arg(format!(
+            "--remote-allow-origins=http://127.0.0.1:{DEBUG_PORT}"
+        ))
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+#[cfg(windows)]
+async fn launch_codex_process(executable: &Path, codex_home: &Path) -> Result<u32, String> {
+    let executable = executable.to_path_buf();
+    let codex_home = codex_home.to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        build_codex_command(&executable, &codex_home)
+            .spawn()
+            .map(|child| child.id())
+            .map_err(|error| format!("启动 Codex Windows 桌面端失败：{error}"))
+    })
+    .await
+    .map_err(|_| "Codex Windows 桌面端启动任务异常中止".to_owned())?
 }
 
 fn emit_progress(app: &AppHandle, stage: &'static str, message: &str) {
@@ -216,6 +260,7 @@ fn codex_executable(install_location: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+#[cfg(test)]
 fn packaged_app_user_model_id(install_location: &str) -> Option<String> {
     let package_name = Path::new(install_location).file_name()?.to_str()?;
     let identity = package_name.split('_').next()?.trim();
@@ -226,7 +271,7 @@ fn packaged_app_user_model_id(install_location: &str) -> Option<String> {
     Some(format!("{identity}_{publisher_id}!App"))
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 async fn activate_packaged_app(app_user_model_id: &str, arguments: &str) -> Result<u32, String> {
     let app_user_model_id = app_user_model_id.to_owned();
     let arguments = arguments.to_owned();
@@ -237,7 +282,7 @@ async fn activate_packaged_app(app_user_model_id: &str, arguments: &str) -> Resu
     .map_err(|_| "Windows 打包应用激活任务异常中止".to_owned())?
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> Result<u32, String> {
     use windows::core::HSTRING;
     use windows::Win32::System::Com::{
@@ -282,11 +327,12 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> R
 }
 
 fn is_primary_target(target: &CdpTarget) -> bool {
+    let is_avatar_overlay = target.url.contains("initialRoute=%2Favatar-overlay")
+        || target.url.contains("initialRoute=/avatar-overlay");
     target.target_type.eq_ignore_ascii_case("page")
-        && (target.url.eq_ignore_ascii_case("app://-/index.html")
-            || (target.title.eq_ignore_ascii_case("Codex")
-                && target.url.starts_with("app://-/")
-                && !target.url.contains("initialRoute=")))
+        && target.title.eq_ignore_ascii_case("Codex")
+        && target.url.starts_with("app://-/")
+        && !is_avatar_overlay
         && target.web_socket_debugger_url.is_some()
 }
 
@@ -314,7 +360,7 @@ async fn primary_target_async() -> Option<CdpTarget> {
         .flatten()
 }
 
-async fn inject_badge(app_version: &str) -> Result<(), String> {
+async fn inject_badge(context: &InjectionContext) -> Result<(), String> {
     let target = primary_target_async()
         .await
         .ok_or_else(|| "Codex 页面尚未准备完成".to_owned())?;
@@ -323,7 +369,15 @@ async fn inject_badge(app_version: &str) -> Result<(), String> {
         .as_deref()
         .ok_or_else(|| "Codex 页面没有可用的调试连接".to_owned())?;
     validate_websocket_url(websocket_url)?;
-    let response = evaluate_script(websocket_url, &badge_script(app_version)).await?;
+    let response = evaluate_script(
+        websocket_url,
+        &badge_script(
+            &context.app_version,
+            &context.assignment.username,
+            context.assignment.total_tokens,
+        ),
+    )
+    .await?;
     if response
         .pointer("/result/result/value")
         .and_then(Value::as_bool)
@@ -396,13 +450,25 @@ async fn evaluate_script(websocket_url: &str, expression: &str) -> Result<Value,
     Ok(response)
 }
 
-fn badge_script(app_version: &str) -> String {
-    let label = serde_json::to_string(&format!("Codex Go {app_version}"))
+fn badge_script(app_version: &str, username: &str, total_tokens: u64) -> String {
+    let version_label = serde_json::to_string(&format!("Codex Go {app_version}"))
         .expect("badge label should serialize");
+    let usage_label = serde_json::to_string(&format_token_millions(total_tokens))
+        .expect("usage label should serialize");
+    let usage_title =
+        serde_json::to_string(&format!("{username} API 密钥累计使用 {total_tokens} Token"))
+            .expect("usage title should serialize");
+    let username = serde_json::to_string(username).expect("username should serialize");
+    let total_tokens =
+        serde_json::to_string(&total_tokens.to_string()).expect("token count should serialize");
     format!(
         r##"(() => {{
   const id = "codex-go-version-badge";
-  const label = {label};
+  const versionLabel = {version_label};
+  const usageLabel = {usage_label};
+  const usageTitle = {usage_title};
+  const username = {username};
+  const totalTokens = {total_tokens};
   const header = document.querySelector(".app-header-tint");
   const menuBar = Array.from(header?.querySelectorAll?.('[class*="ms-auto"][class*="flex"][class*="items-center"]') || [])
     .find((node) => {{
@@ -447,21 +513,27 @@ fn badge_script(app_version: &str) -> String {
   if (!parent) return false;
 
   let badge = document.getElementById(id);
-  if (badge?.dataset.codexGoBadgeVersion !== "2") {{
+  if (badge?.dataset.codexGoBadgeVersion !== "3") {{
     badge?.remove();
     badge = null;
   }}
   if (!badge) {{
     badge = document.createElement("div");
     badge.id = id;
-    badge.dataset.codexGoBadgeVersion = "2";
+    badge.dataset.codexGoBadgeVersion = "3";
     Object.assign(badge.style, {{
-      display: "inline-flex", alignItems: "center", height: "100%",
+      display: "inline-flex", alignItems: "center", gap: "4px", height: "100%",
       flex: "0 0 auto", pointerEvents: "none", webkitAppRegion: "no-drag"
     }});
+    const usage = document.createElement("button");
+    usage.type = "button";
+    usage.tabIndex = -1;
+    usage.dataset.codexGoUsage = "true";
+    Object.assign(usage.style, {{ pointerEvents: "none", cursor: "default", letterSpacing: "0" }});
     const trigger = document.createElement("button");
     trigger.type = "button";
     trigger.tabIndex = -1;
+    trigger.dataset.codexGoVersionTrigger = "true";
     Object.assign(trigger.style, {{ pointerEvents: "none", cursor: "default", letterSpacing: "0" }});
     const dot = document.createElement("span");
     Object.assign(dot.style, {{
@@ -471,7 +543,7 @@ fn badge_script(app_version: &str) -> String {
     const text = document.createElement("span");
     text.dataset.codexGoVersion = "true";
     trigger.append(dot, text);
-    badge.appendChild(trigger);
+    badge.append(usage, trigger);
   }}
   const triggerClasses = String(nativeButtonClass || "").split(/\s+/).filter(Boolean);
   const incompatibleClasses = new Set(["gap-0", "rounded-l-none", "border-l-0", "pl-0.5", "pr-1.5"]);
@@ -482,31 +554,79 @@ fn badge_script(app_version: &str) -> String {
     }});
   }}
   const fallbackClass = "border-token-border no-drag flex items-center gap-1 border whitespace-nowrap select-none rounded-lg text-token-text-tertiary border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
-  badge.querySelector("button").className = normalizedClasses.join(" ") || fallbackClass;
-  badge.querySelector("[data-codex-go-version]").textContent = label;
-  badge.setAttribute("aria-label", label);
-  const trigger = badge.querySelector("button");
-  if (trigger) trigger.setAttribute("aria-label", label);
+  const buttonClass = normalizedClasses.join(" ") || fallbackClass;
+  const usage = badge.querySelector("[data-codex-go-usage]");
+  const trigger = badge.querySelector("[data-codex-go-version-trigger]");
+  if (usage) {{
+    usage.className = buttonClass;
+    usage.textContent = usageLabel;
+    usage.title = usageTitle;
+    usage.setAttribute("aria-label", usageTitle);
+  }}
+  if (trigger) {{
+    trigger.className = buttonClass;
+    trigger.setAttribute("aria-label", versionLabel);
+  }}
+  badge.querySelector("[data-codex-go-version]").textContent = versionLabel;
+  badge.setAttribute("aria-label", `${{usageTitle}}；${{versionLabel}}`);
   const safeBefore = before?.parentElement === parent ? before : null;
   if (badge.parentElement !== parent || badge.nextSibling !== safeBefore) {{
     parent.insertBefore(badge, safeBefore);
   }}
   window.__CODEX_GO_LAUNCHED__ = true;
+  window.__CODEX_GO_USERNAME__ = username;
+  window.__CODEX_GO_TOTAL_TOKENS__ = totalTokens;
   return true;
 }})()"##
     )
 }
 
-fn start_injection_task(app: AppHandle, app_version: String) {
+fn format_token_millions(total_tokens: u64) -> String {
+    format!("{:.2}M Token", total_tokens as f64 / 1_000_000.0)
+}
+
+fn injection_context_store() -> &'static RwLock<Option<InjectionContext>> {
+    INJECTION_CONTEXT.get_or_init(|| RwLock::new(None))
+}
+
+fn injection_context() -> Option<InjectionContext> {
+    injection_context_store()
+        .read()
+        .ok()
+        .and_then(|context| context.clone())
+}
+
+fn set_injection_context(app_version: String, assignment: ApiKeyAssignment) {
+    if let Ok(mut context) = injection_context_store().write() {
+        *context = Some(InjectionContext {
+            app_version,
+            assignment,
+        });
+    }
+}
+
+fn update_usage(key_id: i64, total_tokens: u64) {
+    if let Ok(mut context) = injection_context_store().write() {
+        if let Some(context) = context.as_mut() {
+            if context.assignment.key_id == key_id {
+                context.assignment.total_tokens = total_tokens;
+            }
+        }
+    }
+}
+
+fn start_injection_task(app: AppHandle) {
+    start_watchdog();
     tauri::async_runtime::spawn(async move {
         emit_progress(&app, "connecting", "正在连接 Codex 桌面页面");
         for _ in 0..LAUNCH_ATTEMPTS {
             if primary_target_async().await.is_some() {
-                emit_progress(&app, "injecting", "正在注入 Codex Go 版本信息");
-                if inject_badge(&app_version).await.is_ok() {
-                    start_watchdog(app_version);
-                    emit_progress(&app, "complete", "Codex Go 版本信息已注入");
-                    return;
+                if let Some(context) = injection_context() {
+                    emit_progress(&app, "injecting", "正在注入 Codex Go 版本和用量信息");
+                    if inject_badge(&context).await.is_ok() {
+                        emit_progress(&app, "complete", "Codex Go 版本和用量信息已注入");
+                        return;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -514,7 +634,7 @@ fn start_injection_task(app: AppHandle, app_version: String) {
     });
 }
 
-fn start_watchdog(app_version: String) {
+fn start_watchdog() {
     if WATCHDOG_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -523,13 +643,31 @@ fn start_watchdog(app_version: String) {
     }
 
     tauri::async_runtime::spawn(async move {
+        let mut usage_refresh_ticks = 0u8;
         loop {
             tokio::time::sleep(WATCHDOG_INTERVAL).await;
-            if primary_target_async().await.is_none() {
-                WATCHDOG_RUNNING.store(false, Ordering::Release);
-                return;
+            let Some(context) = injection_context() else {
+                continue;
+            };
+            if primary_target_async().await.is_some() {
+                let _ = inject_badge(&context).await;
             }
-            let _ = inject_badge(&app_version).await;
+
+            usage_refresh_ticks = usage_refresh_ticks.saturating_add(1);
+            if usage_refresh_ticks < USAGE_REFRESH_TICKS {
+                continue;
+            }
+            usage_refresh_ticks = 0;
+
+            let assignment = context.assignment.clone();
+            let key_id = assignment.key_id;
+            if let Ok(Ok(total_tokens)) = tauri::async_runtime::spawn_blocking(move || {
+                crate::sub2api::refresh_usage(&assignment)
+            })
+            .await
+            {
+                update_usage(key_id, total_tokens);
+            }
         }
     });
 }
@@ -695,7 +833,10 @@ fn normalize_windows_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Command, Stdio};
+    use std::{
+        ffi::OsStr,
+        process::{Command, Stdio},
+    };
 
     fn target(url: &str) -> CdpTarget {
         CdpTarget {
@@ -709,6 +850,9 @@ mod tests {
     #[test]
     fn selects_main_codex_page_only() {
         assert!(is_primary_target(&target("app://-/index.html")));
+        assert!(is_primary_target(&target(
+            "app://-/index.html?initialRoute=%2Fprojects"
+        )));
         assert!(!is_primary_target(&target(
             "app://-/index.html?initialRoute=%2Favatar-overlay"
         )));
@@ -716,12 +860,22 @@ mod tests {
 
     #[test]
     fn badge_contains_product_and_escaped_version() {
-        let script = badge_script("1.2.3\"test");
+        let script = badge_script("1.2.3\"test", "jiahao", 5_879_385_801);
         assert!(script.contains("Codex Go 1.2.3\\\"test"));
         assert!(script.contains("codex-go-version-badge"));
+        assert!(script.contains("5879.39M Token"));
+        assert!(script.contains("codexGoUsage"));
+        assert!(script.contains("badge.append(usage, trigger)"));
         assert!(script.contains("__CODEX_GO_LAUNCHED__"));
+        assert!(script.contains("__CODEX_GO_USERNAME__"));
         assert!(script.contains(".app-header-tint"));
         assert!(!script.contains("position: \"fixed\""));
+    }
+
+    #[test]
+    fn formats_token_usage_in_millions() {
+        assert_eq!(format_token_millions(0), "0.00M Token");
+        assert_eq!(format_token_millions(5_879_385_801), "5879.39M Token");
     }
 
     #[test]
@@ -734,6 +888,21 @@ mod tests {
             codex_executable(root.path().to_str().unwrap()),
             Some(app.join("ChatGPT.exe"))
         );
+    }
+
+    #[test]
+    fn scopes_codex_home_to_the_launched_process() {
+        let codex_home = Path::new(r"\\drive\cloud\example\.codex");
+        let command = build_codex_command(Path::new("Codex.exe"), codex_home);
+        let configured_home = command
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new("CODEX_HOME"))
+            .and_then(|(_, value)| value);
+
+        assert_eq!(configured_home, Some(codex_home.as_os_str()));
+        assert!(command
+            .get_args()
+            .any(|argument| argument == OsStr::new("--remote-debugging-port=9230")));
     }
 
     #[test]
@@ -827,7 +996,18 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
             loop {
-                if inject_badge("0.1.1").await.is_ok() {
+                let context = InjectionContext {
+                    app_version: "0.1.1".to_owned(),
+                    assignment: ApiKeyAssignment {
+                        username: "smoke-test".to_owned(),
+                        api_key: "sk-smoke-test".to_owned(),
+                        total_tokens: 1_250_000,
+                        key_id: 1,
+                        created_date: "2026-01-01".to_owned(),
+                        panel_token: "panel-smoke-test".to_owned(),
+                    },
+                };
+                if inject_badge(&context).await.is_ok() {
                     break;
                 }
                 assert!(
@@ -841,9 +1021,14 @@ mod tests {
                 r#"(() => {
                   const badge = document.getElementById('codex-go-version-badge');
                   const text = badge?.querySelector('[data-codex-go-version]')?.textContent;
+                  const usage = badge?.querySelector('[data-codex-go-usage]');
+                  const version = badge?.querySelector('[data-codex-go-version-trigger]');
                   const parent = badge?.parentElement;
                   return {
                     text,
+                    usageText: usage?.textContent,
+                    usageBeforeVersion: !!usage && !!version &&
+                      !!(usage.compareDocumentPosition(version) & Node.DOCUMENT_POSITION_FOLLOWING),
                     insideHeaderSurface: !!badge?.closest('.app-header-tint, [data-testid="app-shell-header-context-menu-surface"]'),
                     insideNativeMenu: !!parent?.matches('[class*="ms-auto"][class*="flex"][class*="items-center"]') ||
                       !!parent?.closest('[data-testid="app-shell-header-context-menu-surface"]'),
@@ -857,6 +1042,14 @@ mod tests {
             assert_eq!(
                 value.get("text").and_then(Value::as_str),
                 Some("Codex Go 0.1.1")
+            );
+            assert_eq!(
+                value.get("usageText").and_then(Value::as_str),
+                Some("1.25M Token")
+            );
+            assert_eq!(
+                value.get("usageBeforeVersion").and_then(Value::as_bool),
+                Some(true)
             );
             assert_eq!(
                 value.get("insideHeaderSurface").and_then(Value::as_bool),

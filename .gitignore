@@ -18,3 +18,4 @@ src-tauri/resources/codex/NOTICE-CODEX.txt
 .vscode/
 artifacts/
 .local-secrets/
+.codex-go-ssh-askpass.cmd

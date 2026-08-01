@@ -5,12 +5,14 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -23,6 +25,26 @@ const MAX_METADATA_FILE_BYTES: u64 = 512 * 1024;
 const MAX_WALK_ENTRIES: usize = 20_000;
 const MAX_PLUGIN_DEPTH: usize = 10;
 const MAX_SKILL_DEPTH: usize = 14;
+const DEFAULT_CODEX_CONFIG: &str = r#"model_provider = "OpenAI"
+model = "gpt-5.5"
+review_model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://api.jiahao.chat"
+wire_api = "responses"
+requires_openai_auth = false
+http_headers = { "x-openai-actor-authorization" = "api.jiahao.chat" }
+
+[features]
+goals = true
+"#;
+
+static CODEX_HOME_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -162,9 +184,88 @@ pub fn detect_codex_status() -> CodexStatus {
 
 /// Resolves `CODEX_HOME`, falling back to the current user's `.codex` folder.
 pub fn resolve_codex_home() -> PathBuf {
+    if let Some(path) = CODEX_HOME_OVERRIDE
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .ok()
+        .and_then(|value| value.clone())
+    {
+        return path;
+    }
+
     let explicit = env::var_os("CODEX_HOME");
     let home = BaseDirs::new().map(|directories| directories.home_dir().to_path_buf());
     resolve_codex_home_from(explicit, home)
+}
+
+/// Overrides the Codex home for this manager process and children it launches.
+/// The override is intentionally kept in memory, so other Codex launch paths
+/// continue to use the normal environment/default resolution.
+pub fn set_codex_home_override(path: Option<PathBuf>) {
+    if let Ok(mut value) = CODEX_HOME_OVERRIDE
+        .get_or_init(|| RwLock::new(None))
+        .write()
+    {
+        *value = path;
+    }
+}
+
+/// Creates or updates the current Drive user's provider credentials while
+/// preserving unrelated settings in an existing config.
+pub fn sync_codex_home_credentials(codex_home: &Path, api_key: &str) -> Result<(), String> {
+    fs::create_dir_all(codex_home).map_err(|error| format!("无法创建 Codex 用户目录：{error}"))?;
+
+    let config_path = codex_home.join("config.toml");
+    let config = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .map_err(|error| format!("无法读取 Codex 配置文件：{error}"))?
+    } else {
+        DEFAULT_CODEX_CONFIG.to_owned()
+    };
+    let mut document = config
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Codex 配置文件格式无效：{error}"))?;
+    ensure_table(&mut document, "model_providers")?;
+    let providers = document["model_providers"]
+        .as_table_mut()
+        .ok_or_else(|| "Codex 配置中的 model_providers 不是表".to_owned())?;
+    if !providers.contains_key("OpenAI") {
+        providers.insert("OpenAI", Item::Table(Table::new()));
+    }
+    let provider = providers["OpenAI"]
+        .as_table_mut()
+        .ok_or_else(|| "Codex 配置中的 model_providers.OpenAI 不是表".to_owned())?;
+    provider["name"] = value("OpenAI");
+    provider["base_url"] = value("https://api.jiahao.chat");
+    provider["wire_api"] = value("responses");
+    provider["experimental_bearer_token"] = value(api_key);
+    provider["requires_openai_auth"] = value(false);
+    let mut headers = toml_edit::InlineTable::new();
+    headers.insert("x-openai-actor-authorization", "api.jiahao.chat".into());
+    provider["http_headers"] = value(headers);
+
+    fs::write(&config_path, document.to_string())
+        .map_err(|error| format!("无法写入 Codex 配置文件：{error}"))?;
+
+    let auth = serde_json::json!({
+        "auth_mode": "apikey",
+        "OPENAI_API_KEY": api_key,
+    });
+    let mut auth_content = serde_json::to_string_pretty(&auth)
+        .map_err(|error| format!("无法生成 Codex 认证文件：{error}"))?;
+    auth_content.push('\n');
+    fs::write(codex_home.join("auth.json"), auth_content)
+        .map_err(|error| format!("无法写入 Codex 认证文件：{error}"))
+}
+
+fn ensure_table(document: &mut DocumentMut, name: &str) -> Result<(), String> {
+    if !document.contains_key(name) {
+        document[name] = Item::Table(Table::new());
+    }
+    document[name]
+        .as_table()
+        .map(|_| ())
+        .ok_or_else(|| format!("Codex 配置中的 {name} 不是表"))
 }
 
 fn resolve_codex_home_from(explicit: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
@@ -714,27 +815,27 @@ pub fn delete_skill(skill_id: &str) -> Result<(), String> {
     let skill = skills
         .iter()
         .find(|skill| skill.id == skill_id)
-        .ok_or_else(|| "Skill 已不存在，请刷新后重试".to_owned())?;
+        .ok_or_else(|| "技能已不存在，请刷新后重试".to_owned())?;
     if skill.official || !skill.can_delete {
-        return Err("OpenAI 官方内置 Skill 不能删除".to_owned());
+        return Err("OpenAI 官方内置技能不能删除".to_owned());
     }
 
     let target = PathBuf::from(&skill.path);
     match skill.origin {
         SkillOrigin::Personal => {
-            remove_inventory_directory(&target, &codex_home.join("skills"), "Skill")
+            remove_inventory_directory(&target, &codex_home.join("skills"), "技能")
         }
         SkillOrigin::Plugin => {
             let plugin_root = plugin_roots
                 .iter()
                 .find(|plugin| canonical_path_is_within(&target, &plugin.path))
-                .ok_or_else(|| "无法确认该 Skill 所属的插件目录".to_owned())?;
+                .ok_or_else(|| "无法确认该技能所属的插件目录".to_owned())?;
             if paths_are_equal(&target, &plugin_root.path) {
-                return Err("该 Skill 与插件共用根目录，请从插件列表删除整个插件".to_owned());
+                return Err("该技能与插件共用根目录，请从插件列表删除整个插件".to_owned());
             }
-            remove_inventory_directory(&target, &plugin_root.path, "Skill")
+            remove_inventory_directory(&target, &plugin_root.path, "技能")
         }
-        SkillOrigin::System | SkillOrigin::Unknown => Err("该 Skill 不能删除".to_owned()),
+        SkillOrigin::System | SkillOrigin::Unknown => Err("该技能不能删除".to_owned()),
     }
 }
 
@@ -745,10 +846,10 @@ pub fn read_skill_content(skill_id: &str) -> Result<String, String> {
     let skill = skills
         .iter()
         .find(|skill| skill.id == skill_id)
-        .ok_or_else(|| "Skill 已不存在，请刷新后重试".to_owned())?;
+        .ok_or_else(|| "技能已不存在，请刷新后重试".to_owned())?;
     let path = PathBuf::from(&skill.path).join("SKILL.md");
     read_limited_text(&path, MAX_METADATA_FILE_BYTES)
-        .map_err(|_| "无法读取该 Skill 的 SKILL.md".to_owned())
+        .map_err(|_| "无法读取该技能的 SKILL.md".to_owned())
 }
 
 fn plugin_container_path(plugin_path: &Path, cache_root: &Path) -> Option<PathBuf> {
@@ -1572,6 +1673,41 @@ mod tests {
             resolve_codex_home_from(None, Some(PathBuf::from("C:/Users/example"))),
             PathBuf::from("C:/Users/example").join(".codex")
         );
+    }
+
+    #[test]
+    fn default_config_matches_the_shared_provider_defaults_without_a_secret() {
+        assert!(DEFAULT_CODEX_CONFIG.contains("windows_wsl_setup_acknowledged = true"));
+        assert!(DEFAULT_CODEX_CONFIG.contains("model = \"gpt-5.5\""));
+        assert!(DEFAULT_CODEX_CONFIG.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(!DEFAULT_CODEX_CONFIG.contains("experimental_bearer_token"));
+    }
+
+    #[test]
+    fn creates_config_and_auth_then_rotates_only_provider_credentials() {
+        let temporary = tempdir().unwrap();
+        let codex_home = temporary.path().join(".codex");
+
+        sync_codex_home_credentials(&codex_home, "sk-first").unwrap();
+        let config_path = codex_home.join("config.toml");
+        let generated = fs::read_to_string(&config_path).unwrap();
+        assert!(generated.contains("experimental_bearer_token = \"sk-first\""));
+        let auth: Value =
+            serde_json::from_str(&fs::read_to_string(codex_home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-first");
+
+        fs::write(
+            &config_path,
+            "model = \"custom-model\"\n[model_providers.OpenAI]\nexperimental_bearer_token = \"old\"\n",
+        )
+        .unwrap();
+        sync_codex_home_credentials(&codex_home, "sk-second").unwrap();
+        let updated = fs::read_to_string(config_path).unwrap();
+        assert!(updated.contains("model = \"custom-model\""));
+        assert!(updated.contains("experimental_bearer_token = \"sk-second\""));
+        assert!(!updated.contains("experimental_bearer_token = \"old\""));
     }
 
     #[test]

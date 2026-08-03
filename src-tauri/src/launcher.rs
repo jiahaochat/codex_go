@@ -131,36 +131,15 @@ pub async fn launch(
         .and_then(codex_executable)
         .ok_or_else(|| "无法定位官方 Codex Windows 桌面端的启动文件".to_owned())?;
     let processes = desktop_processes(&executable);
-    let managed = primary_target_async().await.is_some();
-    let current = classify_runtime(
-        !processes.process_ids.is_empty(),
-        processes.visible_window,
-        managed,
-    );
-    let same_managed_user = current.managed
-        && injection_context()
-            .is_some_and(|context| context.assignment.username == assignment.username);
     set_injection_context(app_version, assignment);
 
-    if same_managed_user {
-        emit_progress(app, "complete", "Codex 已运行");
-        start_injection_task(app.clone());
-        return Ok(current);
-    }
-
-    if !processes.process_ids.is_empty() {
-        emit_progress(
-            app,
-            "cleaning",
-            "正在关闭当前 Codex 并通过 Codex Go 重新启动",
-        );
-        let cleanup_executable = executable.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            terminate_background_processes(&cleanup_executable, &processes)
-        })
-        .await
-        .map_err(|_| "清理 Codex 后台进程时发生内部错误".to_owned())??;
-    }
+    emit_progress(app, "cleaning", "正在关闭所有 ChatGPT 后台进程");
+    let cleanup_executable = executable.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        terminate_all_codex_processes(&cleanup_executable, &processes)
+    })
+    .await
+    .map_err(|_| "清理 ChatGPT 后台进程时发生内部错误".to_owned())??;
 
     if TcpListener::bind(("127.0.0.1", DEBUG_PORT)).is_err() {
         return Err(format!(
@@ -450,9 +429,7 @@ async fn evaluate_script(websocket_url: &str, expression: &str) -> Result<Value,
     Ok(response)
 }
 
-fn badge_script(app_version: &str, username: &str, total_tokens: u64) -> String {
-    let version_label = serde_json::to_string(&format!("Codex Go {app_version}"))
-        .expect("badge label should serialize");
+fn badge_script(_app_version: &str, username: &str, total_tokens: u64) -> String {
     let usage_label = serde_json::to_string(&format_token_millions(total_tokens))
         .expect("usage label should serialize");
     let usage_title =
@@ -464,7 +441,6 @@ fn badge_script(app_version: &str, username: &str, total_tokens: u64) -> String 
     format!(
         r##"(() => {{
   const id = "codex-go-version-badge";
-  const versionLabel = {version_label};
   const usageLabel = {usage_label};
   const usageTitle = {usage_title};
   const username = {username};
@@ -513,14 +489,14 @@ fn badge_script(app_version: &str, username: &str, total_tokens: u64) -> String 
   if (!parent) return false;
 
   let badge = document.getElementById(id);
-  if (badge?.dataset.codexGoBadgeVersion !== "3") {{
+  if (badge?.dataset.codexGoBadgeVersion !== "4") {{
     badge?.remove();
     badge = null;
   }}
   if (!badge) {{
     badge = document.createElement("div");
     badge.id = id;
-    badge.dataset.codexGoBadgeVersion = "3";
+    badge.dataset.codexGoBadgeVersion = "4";
     Object.assign(badge.style, {{
       display: "inline-flex", alignItems: "center", gap: "4px", height: "100%",
       flex: "0 0 auto", pointerEvents: "none", webkitAppRegion: "no-drag"
@@ -530,20 +506,13 @@ fn badge_script(app_version: &str, username: &str, total_tokens: u64) -> String 
     usage.tabIndex = -1;
     usage.dataset.codexGoUsage = "true";
     Object.assign(usage.style, {{ pointerEvents: "none", cursor: "default", letterSpacing: "0" }});
-    const trigger = document.createElement("button");
-    trigger.type = "button";
-    trigger.tabIndex = -1;
-    trigger.dataset.codexGoVersionTrigger = "true";
-    Object.assign(trigger.style, {{ pointerEvents: "none", cursor: "default", letterSpacing: "0" }});
     const dot = document.createElement("span");
     Object.assign(dot.style, {{
       width: "9px", height: "9px", flex: "0 0 auto", borderRadius: "999px",
       display: "inline-block", background: "#34d399", boxShadow: "0 0 8px rgba(52,211,153,.75)"
     }});
-    const text = document.createElement("span");
-    text.dataset.codexGoVersion = "true";
-    trigger.append(dot, text);
-    badge.append(usage, trigger);
+    usage.prepend(dot);
+    badge.append(usage);
   }}
   const triggerClasses = String(nativeButtonClass || "").split(/\s+/).filter(Boolean);
   const incompatibleClasses = new Set(["gap-0", "rounded-l-none", "border-l-0", "pl-0.5", "pr-1.5"]);
@@ -556,19 +525,15 @@ fn badge_script(app_version: &str, username: &str, total_tokens: u64) -> String 
   const fallbackClass = "border-token-border no-drag flex items-center gap-1 border whitespace-nowrap select-none rounded-lg text-token-text-tertiary border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
   const buttonClass = normalizedClasses.join(" ") || fallbackClass;
   const usage = badge.querySelector("[data-codex-go-usage]");
-  const trigger = badge.querySelector("[data-codex-go-version-trigger]");
   if (usage) {{
     usage.className = buttonClass;
+    const dot = usage.querySelector("span");
     usage.textContent = usageLabel;
+    if (dot) usage.prepend(dot);
     usage.title = usageTitle;
     usage.setAttribute("aria-label", usageTitle);
   }}
-  if (trigger) {{
-    trigger.className = buttonClass;
-    trigger.setAttribute("aria-label", versionLabel);
-  }}
-  badge.querySelector("[data-codex-go-version]").textContent = versionLabel;
-  badge.setAttribute("aria-label", `${{usageTitle}}；${{versionLabel}}`);
+  badge.setAttribute("aria-label", usageTitle);
   const safeBefore = before?.parentElement === parent ? before : null;
   if (badge.parentElement !== parent || badge.nextSibling !== safeBefore) {{
     parent.insertBefore(badge, safeBefore);
@@ -622,9 +587,9 @@ fn start_injection_task(app: AppHandle) {
         for _ in 0..LAUNCH_ATTEMPTS {
             if primary_target_async().await.is_some() {
                 if let Some(context) = injection_context() {
-                    emit_progress(&app, "injecting", "正在注入 Codex Go 版本和用量信息");
+                    emit_progress(&app, "injecting", "正在注入 API 用量信息");
                     if inject_badge(&context).await.is_ok() {
-                        emit_progress(&app, "complete", "Codex Go 版本和用量信息已注入");
+                        emit_progress(&app, "complete", "API 用量信息已注入");
                         return;
                     }
                 }
@@ -790,7 +755,7 @@ fn has_visible_window(process_ids: &HashSet<u32>) -> bool {
 }
 
 #[cfg(windows)]
-fn terminate_background_processes(
+fn terminate_all_codex_processes(
     executable: &Path,
     processes: &DesktopProcesses,
 ) -> Result<(), String> {
@@ -798,6 +763,18 @@ fn terminate_background_processes(
         Foundation::CloseHandle,
         System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
     };
+
+    for image_name in ["ChatGPT.exe", "Codex.exe"] {
+        let mut command = Command::new("taskkill.exe");
+        command
+            .args(["/F", "/T", "/IM", image_name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+        let _ = command.status();
+    }
 
     for process_id in &processes.process_ids {
         unsafe {
@@ -819,7 +796,7 @@ fn terminate_background_processes(
 }
 
 #[cfg(not(windows))]
-fn terminate_background_processes(
+fn terminate_all_codex_processes(
     _executable: &Path,
     _processes: &DesktopProcesses,
 ) -> Result<(), String> {
@@ -859,13 +836,13 @@ mod tests {
     }
 
     #[test]
-    fn badge_contains_product_and_escaped_version() {
+    fn badge_contains_usage_without_a_version_label() {
         let script = badge_script("1.2.3\"test", "jiahao", 5_879_385_801);
-        assert!(script.contains("Codex Go 1.2.3\\\"test"));
         assert!(script.contains("codex-go-version-badge"));
         assert!(script.contains("5879.39M Token"));
         assert!(script.contains("codexGoUsage"));
-        assert!(script.contains("badge.append(usage, trigger)"));
+        assert!(script.contains("badge.append(usage)"));
+        assert!(!script.contains("data-codex-go-version"));
         assert!(script.contains("__CODEX_GO_LAUNCHED__"));
         assert!(script.contains("__CODEX_GO_USERNAME__"));
         assert!(script.contains(".app-header-tint"));
@@ -965,7 +942,7 @@ mod tests {
             panic!("hidden ChatGPT fixture was not detected");
         }
         assert!(!processes.visible_window);
-        terminate_background_processes(&executable, &processes).unwrap();
+        terminate_all_codex_processes(&executable, &processes).unwrap();
         assert!(desktop_processes(&executable).process_ids.is_empty());
         let _ = child.wait();
     }
@@ -1020,15 +997,10 @@ mod tests {
                 target.web_socket_debugger_url.as_deref().unwrap(),
                 r#"(() => {
                   const badge = document.getElementById('codex-go-version-badge');
-                  const text = badge?.querySelector('[data-codex-go-version]')?.textContent;
                   const usage = badge?.querySelector('[data-codex-go-usage]');
-                  const version = badge?.querySelector('[data-codex-go-version-trigger]');
                   const parent = badge?.parentElement;
                   return {
-                    text,
                     usageText: usage?.textContent,
-                    usageBeforeVersion: !!usage && !!version &&
-                      !!(usage.compareDocumentPosition(version) & Node.DOCUMENT_POSITION_FOLLOWING),
                     insideHeaderSurface: !!badge?.closest('.app-header-tint, [data-testid="app-shell-header-context-menu-surface"]'),
                     insideNativeMenu: !!parent?.matches('[class*="ms-auto"][class*="flex"][class*="items-center"]') ||
                       !!parent?.closest('[data-testid="app-shell-header-context-menu-surface"]'),
@@ -1040,16 +1012,8 @@ mod tests {
             .expect("injected badge should be readable");
             let value = response.pointer("/result/result/value").unwrap();
             assert_eq!(
-                value.get("text").and_then(Value::as_str),
-                Some("Codex Go 0.1.1")
-            );
-            assert_eq!(
                 value.get("usageText").and_then(Value::as_str),
                 Some("1.25M Token")
-            );
-            assert_eq!(
-                value.get("usageBeforeVersion").and_then(Value::as_bool),
-                Some(true)
             );
             assert_eq!(
                 value.get("insideHeaderSurface").and_then(Value::as_bool),

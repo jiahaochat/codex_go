@@ -35,13 +35,17 @@ import {
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import codexGoIcon from "../assets/codex-go-icon.png";
+import chatgptIcon from "../assets/chatgpt-icon.png";
 import {
   checkAppUpdate,
   checkCodexUpdate,
   deletePlugin,
   deleteSkill,
   getDriveSession,
+  getApiUsage,
+  getCodexRuntime,
   getSnapshot,
+  getUserAvatar,
   installAppUpdate,
   installCodex,
   launchCodex,
@@ -57,6 +61,7 @@ import {
   readSkillContent,
   revealPath,
   type AppSnapshot,
+  type ApiUsageSummary,
   type CodexLaunchProgress,
   type DriveSession,
   type DriveDirectory,
@@ -92,8 +97,8 @@ const originLabels = {
 
 const runtimeLabels = {
   stopped: "未运行",
-  unmanaged: "未通过 Codex Go 运行",
-  managed: "已运行",
+  unmanaged: "请通过 Codex Go 运行",
+  managed: "已通过 Codex Go 运行",
 };
 
 function launchButtonLabel(progress: CodexLaunchProgress | null): string {
@@ -107,7 +112,7 @@ function launchButtonLabel(progress: CodexLaunchProgress | null): string {
 }
 
 function runButtonLabel(state: AppSnapshot["codexRuntime"]["state"]): string {
-  if (state === "managed") return "已运行";
+  if (state === "managed") return "重新运行";
   if (state === "unmanaged") return "从 Codex Go 运行";
   return "运行";
 }
@@ -136,6 +141,8 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [apiUsage, setApiUsage] = useState<ApiUsageSummary | null>(null);
+  const [userAvatar, setUserAvatar] = useState<string | null>(null);
 
   const load = useCallback(async (refresh = false) => {
     refresh ? setRefreshing(true) : setLoading(true);
@@ -167,6 +174,39 @@ function App() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!driveSession?.authenticated || !snapshot?.codex) return;
+    let stopped = false;
+    const refreshRuntime = async () => {
+      try {
+        const runtime = await getCodexRuntime(snapshot.codex);
+        if (!stopped) setSnapshot((current) => current ? { ...current, codexRuntime: runtime } : current);
+      } catch { /* Keep the last known status during transient checks. */ }
+    };
+    void refreshRuntime();
+    const timer = window.setInterval(() => void refreshRuntime(), 2000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [driveSession?.authenticated, snapshot?.codex.installed, snapshot?.codex.path, snapshot?.codex.version]);
+
+  useEffect(() => {
+    if (!driveSession?.authenticated) return;
+    let stopped = false;
+    const refreshUsage = async () => {
+      try {
+        const usage = await getApiUsage();
+        if (!stopped) setApiUsage(usage);
+      } catch { /* Usage stays unavailable until the next refresh. */ }
+    };
+    void refreshUsage();
+    const timer = window.setInterval(() => void refreshUsage(), 30000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [driveSession?.authenticated, driveSession?.username]);
+
+  useEffect(() => {
+    if (!driveSession?.authenticated) return;
+    void getUserAvatar().then(setUserAvatar).catch(() => setUserAvatar(null));
+  }, [driveSession?.authenticated, driveSession?.username]);
 
   useEffect(() => {
     setCodexUpdateAvailable(false);
@@ -323,6 +363,14 @@ function App() {
     }
   };
 
+  const refreshOverview = () => {
+    void load(true);
+    if (driveSession?.authenticated) {
+      void getApiUsage().then(setApiUsage).catch(() => undefined);
+      void getUserAvatar().then(setUserAvatar).catch(() => setUserAvatar(null));
+    }
+  };
+
   if (!driveSession?.authenticated) {
     return (
       <div className="app-frame">
@@ -357,15 +405,13 @@ function App() {
           onChange={setView}
           snapshot={snapshot}
           driveSession={driveSession}
+          userAvatar={userAvatar}
           onOpenDrive={() => setView("drive")}
           onSignOut={() => void signOutDrive()}
         />
         <main className="main-panel">
           <header className="topbar">
-            <div>
-              <p className="eyebrow">本机 Codex 管理</p>
-              <h1>{title}</h1>
-            </div>
+            {view === "overview" ? <UsageStrip usage={apiUsage} /> : <div><h1>{title}</h1></div>}
             <div className="topbar-actions">
               {snapshot && <span className="checked-at">更新于 {formatTime(snapshot.checkedAt)}</span>}
               <button
@@ -374,7 +420,7 @@ function App() {
                 title="刷新本机状态"
                 aria-label="刷新本机状态"
                 disabled={refreshing}
-                onClick={() => void load(true)}
+                onClick={refreshOverview}
               >
                 <RefreshCw size={18} className={refreshing ? "spin" : undefined} />
               </button>
@@ -689,6 +735,7 @@ function Sidebar({
   onChange,
   snapshot,
   driveSession,
+  userAvatar,
   onOpenDrive,
   onSignOut,
 }: {
@@ -696,6 +743,7 @@ function Sidebar({
   onChange: (view: View) => void;
   snapshot: AppSnapshot | null;
   driveSession: DriveSession;
+  userAvatar: string | null;
   onOpenDrive: () => void;
   onSignOut: () => void;
 }) {
@@ -731,7 +779,7 @@ function Sidebar({
         <ChevronRight size={15} />
       </button>
       <div className="sidebar-footer">
-        <span className="user-avatar"><UserRound size={15} /></span>
+        <span className="user-avatar">{userAvatar ? <img src={userAvatar} alt="" referrerPolicy="no-referrer" /> : <UserRound size={15} />}</span>
         <div>
           <strong>{driveSession.username}</strong>
           <span>Drive 已登录</span>
@@ -793,13 +841,6 @@ function Overview({
               <span>{warning}</span>
             </div>
           ))}
-        </div>
-      ) : null}
-
-      {snapshot.codexRuntime.state === "unmanaged" ? (
-        <div className="warning-row launch-warning">
-          <CircleAlert size={17} />
-          <span>当前 Codex 桌面端不是通过 Codex Go 启动。点击“从 Codex Go 运行”后将自动关闭当前 Codex 并重新启动。</span>
         </div>
       ) : null}
 
@@ -884,33 +925,20 @@ function CodexHero({
   return (
     <section className={installed ? "codex-hero installed" : "codex-hero missing"}>
       <div className="hero-icon">
-        {installed ? <TerminalSquare size={29} /> : <Download size={29} />}
+        {installed ? <img src={chatgptIcon} alt="" aria-hidden="true" /> : <Download size={29} />}
       </div>
       <div className="hero-copy">
         <div className="hero-title-line">
-          <h2>{installed ? "Codex Windows 桌面端已安装" : "尚未安装 Codex Windows 桌面端"}</h2>
+          <h2>Codex Windows 桌面端</h2>
           <StatusPill tone={!installed || runtime.state === "unmanaged" ? "warning" : runtime.state === "managed" ? "success" : "neutral"}>
-            {installed ? runtimeLabels[runtime.state] : "需要安装"}
+            {installed ? runtimeLabels[runtime.state] : "未安装"}
           </StatusPill>
         </div>
-        <p>
-          {installed
-            ? snapshot.codex.path ?? "已通过 Microsoft Store 识别 Codex Windows 桌面端"
-            : "从 Microsoft Store 安装 OpenAI 官方 Codex Windows 桌面端。"}
-        </p>
-        <div className="hero-meta">
-          <span><FolderOpen size={15} /> {snapshot.codexHome}</span>
-          <span><ShieldCheck size={15} /> Microsoft Store 官方分发</span>
-        </div>
+        <p>{installed ? snapshot.codex.version ?? "版本未知" : "需要安装后才能运行"}</p>
         {updateAvailable ? (
           <div className="hero-update-notice"><CircleAlert size={15} /> Codex Windows 桌面端有新版本，请点击“版本更新”完成升级。</div>
         ) : installed && updateChecked ? (
           <div className="hero-current-notice"><Check size={15} /> 当前已是 Microsoft Store 提供的最新版本。</div>
-        ) : null}
-        {runtime.state === "managed" ? (
-          <div className="hero-current-notice"><Check size={15} /> 已注入 Codex Go {snapshot.appVersion} 版本标识。</div>
-        ) : runtime.state === "unmanaged" ? (
-          <div className="hero-update-notice"><CircleAlert size={15} /> 点击“从 Codex Go 运行”将自动关闭当前 Codex 并通过本软件重新启动。</div>
         ) : null}
         {installing && progress ? (
           <div className="install-progress" aria-live="polite">
@@ -1256,7 +1284,7 @@ function SettingsView({
       <section className="settings-section">
         <div className="settings-heading">
           <div className="settings-icon"><TerminalSquare size={20} /></div>
-          <div><h2>Codex Windows 桌面端</h2><p>Microsoft Store 官方安装与本机检测</p></div>
+          <div><h2>Codex Windows 桌面端</h2><p>桌面端版本与运行状态</p></div>
         </div>
         <dl className="details-list">
           <div><dt>状态</dt><dd><StatusPill tone={snapshot.codex.installed ? "success" : "warning"}>{snapshot.codex.installed ? "已安装" : "未安装"}</StatusPill></dd></div>
@@ -1265,8 +1293,6 @@ function SettingsView({
           {snapshot.codex.installed ? (
             <div><dt>更新状态</dt><dd><StatusPill tone={codexUpdateAvailable ? "warning" : codexUpdateChecked ? "success" : "neutral"}>{checkingCodexUpdate ? "正在检查" : codexUpdateAvailable ? "发现新版本" : codexUpdateChecked ? "已是最新" : "尚未检查"}</StatusPill></dd></div>
           ) : null}
-          <div><dt>安装位置</dt><dd className="path-value">{snapshot.codex.path ?? "未检测到"}</dd></div>
-          <div><dt>分发渠道</dt><dd>{snapshot.codex.source ?? "-"}</dd></div>
           <div><dt>CODEX_HOME</dt><dd className="path-value">{snapshot.codexHome}</dd></div>
         </dl>
         <div className="command-row">
@@ -1469,6 +1495,24 @@ function SkillDetailDialog({
     </div>,
     document.body,
   );
+}
+
+function UsageStrip({ usage }: { usage: ApiUsageSummary | null }) {
+  const items = [
+    ["总花费", usage ? formatCurrency(usage.totalCost) : "--"],
+    ["总 Token", usage ? formatTokenM(usage.totalTokens) : "--"],
+    ["近 30 天花费", usage ? formatCurrency(usage.recent30dCost) : "--"],
+    ["近 30 天 Token", usage ? formatTokenM(usage.recent30dTokens) : "--"],
+  ];
+  return <div className="usage-strip">{items.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</div>;
+}
+
+function formatCurrency(value: number): string {
+  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatTokenM(value: number): string {
+  return `${(value / 1_000_000).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} M`;
 }
 
 function MarkdownPreview({ content }: { content: string }) {

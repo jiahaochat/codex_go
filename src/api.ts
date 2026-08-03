@@ -63,6 +63,13 @@ export interface AppSnapshot {
   checkedAt: string;
 }
 
+export interface ApiUsageSummary {
+  totalTokens: number;
+  totalCost: number;
+  recent30dTokens: number;
+  recent30dCost: number;
+}
+
 export interface DriveSession {
   authenticated: boolean;
   username: string | null;
@@ -260,6 +267,21 @@ export async function refreshSnapshot(): Promise<AppSnapshot> {
     return { ...previewSnapshot, checkedAt: new Date().toISOString() };
   }
   return invoke<AppSnapshot>("refresh_snapshot");
+}
+
+export async function getCodexRuntime(codex: CodexStatus): Promise<CodexRuntimeStatus> {
+  if (!isTauri()) return previewSnapshot.codexRuntime;
+  return invoke<CodexRuntimeStatus>("get_codex_runtime", { codex });
+}
+
+export async function getApiUsage(): Promise<ApiUsageSummary> {
+  if (!isTauri()) return { totalTokens: 6059391307, totalCost: 6218.91, recent30dTokens: 3708558650, recent30dCost: 3726.54 };
+  return invoke<ApiUsageSummary>("get_api_usage");
+}
+
+export async function getUserAvatar(): Promise<string | null> {
+  if (!isTauri()) return null;
+  return invoke<string | null>("get_user_avatar");
 }
 
 export async function installCodex(): Promise<void> {

@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::blocking::{Client, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
@@ -15,6 +15,15 @@ pub struct ApiKeyAssignment {
     pub(crate) key_id: i64,
     pub(crate) created_date: String,
     pub(crate) panel_token: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUsageSummary {
+    pub total_tokens: u64,
+    pub total_cost: f64,
+    pub recent_30d_tokens: u64,
+    pub recent_30d_cost: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +65,8 @@ struct GroupRecord {
 struct UsageStats {
     #[serde(default)]
     total_tokens: u64,
+    #[serde(default)]
+    total_actual_cost: f64,
 }
 
 #[derive(Serialize)]
@@ -141,6 +152,41 @@ pub fn refresh_usage(assignment: &ApiKeyAssignment) -> Result<u64, String> {
             })
         }
     }
+}
+
+pub fn usage_for_username(username: &str) -> Result<ApiUsageSummary, String> {
+    let client = Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| format!("无法初始化 API 用量连接：{error}"))?;
+    let panel_token = login(&client)?;
+    let record = find_key(&client, &panel_token, username)?
+        .ok_or_else(|| format!("尚未找到名为“{username}”的 API 密钥"))?;
+    let created_date = record.created_at.get(..10).unwrap_or("2020-01-01");
+    let today = Utc::now().date_naive();
+    let total = fetch_usage_stats(
+        &client,
+        &panel_token,
+        record.id,
+        created_date,
+        &today.format("%Y-%m-%d").to_string(),
+    )?;
+    let recent_start = (today - ChronoDuration::days(29))
+        .format("%Y-%m-%d")
+        .to_string();
+    let recent = fetch_usage_stats(
+        &client,
+        &panel_token,
+        record.id,
+        &recent_start,
+        &today.format("%Y-%m-%d").to_string(),
+    )?;
+    Ok(ApiUsageSummary {
+        total_tokens: total.total_tokens,
+        total_cost: total.total_actual_cost,
+        recent_30d_tokens: recent.total_tokens,
+        recent_30d_cost: recent.total_actual_cost,
+    })
 }
 
 fn login(client: &Client) -> Result<String, String> {
@@ -231,19 +277,29 @@ fn fetch_usage(
     created_date: &str,
 ) -> Result<u64, String> {
     let end_date = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+    Ok(fetch_usage_stats(client, panel_token, key_id, created_date, &end_date)?.total_tokens)
+}
+
+fn fetch_usage_stats(
+    client: &Client,
+    panel_token: &str,
+    key_id: i64,
+    start_date: &str,
+    end_date: &str,
+) -> Result<UsageStats, String> {
     let response = client
         .get(format!("{API_ROOT}/usage/stats"))
         .bearer_auth(panel_token)
         .query(&[
             ("api_key_id", key_id.to_string()),
-            ("start_date", created_date.to_owned()),
-            ("end_date", end_date),
+            ("start_date", start_date.to_owned()),
+            ("end_date", end_date.to_owned()),
             ("timezone", "Asia/Shanghai".to_owned()),
         ])
         .send()
         .map_err(|error| format!("无法查询 API 密钥 token 用量：{error}"))?;
     let stats: UsageStats = decode(response, "查询 API 密钥 token 用量")?;
-    Ok(stats.total_tokens)
+    Ok(stats)
 }
 
 fn decode<T: DeserializeOwned>(response: Response, action: &str) -> Result<T, String> {

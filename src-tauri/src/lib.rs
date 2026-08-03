@@ -3,6 +3,7 @@ mod installer;
 mod inventory;
 mod launcher;
 mod process_guard;
+mod profile;
 mod proxy;
 mod secrets;
 mod sub2api;
@@ -151,6 +152,45 @@ async fn get_snapshot(app: AppHandle) -> Result<AppSnapshot, String> {
 #[tauri::command]
 async fn refresh_snapshot(app: AppHandle) -> Result<AppSnapshot, String> {
     collect_snapshot(app).await
+}
+
+#[tauri::command]
+async fn get_codex_runtime(codex: CodexStatus) -> Result<launcher::CodexRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || launcher::runtime_status(&codex))
+        .await
+        .map_err(|_| "读取 Codex 运行状态时发生内部错误".to_owned())
+}
+
+#[tauri::command]
+async fn get_api_usage(
+    drive: State<'_, Arc<drive::DriveState>>,
+) -> Result<sub2api::ApiUsageSummary, String> {
+    let drive = drive.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = drive.session()?;
+        let username = session
+            .username
+            .ok_or_else(|| "尚未登录 Drive".to_owned())?;
+        sub2api::usage_for_username(&username)
+    })
+    .await
+    .map_err(|_| "读取 API 用量时发生内部错误".to_owned())?
+}
+
+#[tauri::command]
+async fn get_user_avatar(
+    drive: State<'_, Arc<drive::DriveState>>,
+) -> Result<Option<String>, String> {
+    let drive = drive.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = drive.session()?;
+        let username = session
+            .username
+            .ok_or_else(|| "尚未登录 Drive".to_owned())?;
+        Ok(profile::user_avatar(&username).ok().flatten())
+    })
+    .await
+    .map_err(|_| "读取用户头像时发生内部错误".to_owned())?
 }
 
 #[tauri::command]
@@ -362,6 +402,9 @@ pub fn run() {
             open_drive_file,
             get_snapshot,
             refresh_snapshot,
+            get_codex_runtime,
+            get_api_usage,
+            get_user_avatar,
             delete_plugin,
             delete_skill,
             read_skill_content,

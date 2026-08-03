@@ -1,0 +1,2 @@
+The bundled ChatGPT icon is copied from the installed OpenAI.Codex Microsoft Store package:
+app/resources/default_app/icon.png
